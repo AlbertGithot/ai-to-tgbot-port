@@ -104,6 +104,34 @@ The bot will automatically start `llama-server` and communicate with it via a lo
 
 ---
 
+## ⚠️ Disclaimer
+
+`bot.py` was generated and adapted with the help of AI.
+It has not been fully reviewed or manually polished, so expect possible issues or нестабильное поведение.
+
+---
+
+## 💸 Support the Author
+
+If you like this project, you can support the author:
+
+* **USDT (TON):**
+  UQDCmDuVnhwvZ6EW6qv0J_nV1_7U9-IPCKYo3L279JId0qbU
+
+* **TON:**
+  UQBN03z--f0LsRcODzNLukobgrGIt6lo-MAn-FX7l1KBKZZI
+
+* **BTC:**
+  bc1q4tpzte0efcn9xsf67dcuzw6e749dahnm0j7f8m
+
+---
+
+## 📬 Contact
+
+Telegram: @Default_Netion
+
+---
+
 ## 📦 Notes
 
 * Model files and logs are ignored via `.gitignore`
@@ -115,3 +143,4 @@ The bot will automatically start `llama-server` and communicate with it via a lo
 ## 🔗 Source Code
 
 https://github.com/AlbertGithot/Qwen3.5-Uncensored-But-On-TG-Bot.git
+

@@ -1,5 +1,8 @@
 # 🤖 Qwen3.5 Uncensored Telegram Bot
 
+<img src="https://github.com/devicons/devicon/blob/master/icons/python/python-original.svg" title="Python"  alt="Python" width="40" height="40"/>&nbsp;
+<img src="https://avatars.githubusercontent.com/u/33784865?s=280&v=4" title="Aiogram"  alt="Aiogram" width="40" height="40"/>&nbsp;
+
 Telegram bot for local GGUF models on top of `llama.cpp`.
 
 This project includes a Telegram bot, a desktop control panel, a SQLite database for activity tracking, and a direct AI interaction interface — all managed from a single entrypoint.

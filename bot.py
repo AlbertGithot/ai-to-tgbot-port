@@ -26,6 +26,28 @@ from bot_control_db import (
     upsert_user,
 )
 
+ENV_FILE_PATH = Path(__file__).resolve().parent / ".env"
+
+
+def load_env_file(path: Path) -> None:
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+load_env_file(ENV_FILE_PATH)
+
 init_db()
 
 try:
@@ -78,7 +100,11 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 def env_path(name: str, default: str) -> Path:
-    return Path(os.getenv(name, default)).expanduser()
+    raw_value = os.getenv(name, default).strip()
+    path = Path(raw_value).expanduser()
+    if path.is_absolute():
+        return path
+    return (ENV_FILE_PATH.parent / path).resolve()
 
 BOT_TOKEN = env_str("BOT_TOKEN")
 MODEL_PATH = env_path(
@@ -142,6 +168,7 @@ TELEGRAM_SEGMENT_LIMIT = env_int("TELEGRAM_SEGMENT_LIMIT", 3800)
 SHOW_MODEL_RAW = env_bool("SHOW_MODEL_RAW", True)
 USE_RAW_MODEL_REPLY = env_bool("USE_RAW_MODEL_REPLY", True)
 ENABLE_REPAIR_PASS = env_bool("ENABLE_REPAIR_PASS", True)
+AI_ENABLED = env_bool("AI_ENABLED", True)
 THINKING_PLACEHOLDER_TEXT = "Подожди, я думаю...."
 MAX_TRACKED_BOT_MESSAGES = env_int("MAX_TRACKED_BOT_MESSAGES", 80)
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -197,7 +224,7 @@ BRIEF_REPLY_STYLE_PROMPT = (
     "Только финальный ответ."
 )
 BRIEF_REPLY_MAX_CHARS = 320
-PROMPT_SNAPSHOT_SIGNATURE = "v5-local-config-and-limits"
+PROMPT_SNAPSHOT_SIGNATURE = "v6-env-bat-launcher"
 
 LOG_DIR = Path("bot_logs")
 RUNTIME_LOG_PATH = LOG_DIR / "runtime.log"
@@ -315,7 +342,7 @@ def build_license_notice_text() -> str:
 
 
 def is_ai_enabled() -> bool:
-    return (get_setting("ai_enabled", "1") or "1").strip() not in {"0", "false", "False"}
+    return AI_ENABLED
 
 
 def build_start_keyboard() -> InlineKeyboardMarkup:
@@ -629,7 +656,8 @@ def get_dialog_history(dialog_key: str) -> deque[dict[str, str]]:
     touch_dialog_state(dialog_key)
     history = dialog_histories.get(dialog_key)
     if history is None:
-        history = deque(maxlen=MAX_HISTORY_MESSAGES)
+        history_limit = None if MAX_HISTORY_MESSAGES < 1 else MAX_HISTORY_MESSAGES
+        history = deque(maxlen=history_limit)
         dialog_histories[dialog_key] = history
     return history
 
@@ -2555,26 +2583,17 @@ def run_ai_worker() -> None:
         stop_llama_server()
 
 
-def launch_control_panel() -> None:
-    from bot_control_panel import launch_control_panel as launch_gui
-
-    bootstrap_from_interactions(INTERACTIONS_LOG_PATH)
-    launch_gui(
-        script_path=Path(__file__).resolve(),
-        project_root=PROJECT_ROOT,
-        model_path=MODEL_PATH,
-    )
-
-
 if __name__ == "__main__":
     try:
-        mode = sys.argv[1] if len(sys.argv) > 1 else "--gui"
+        mode = sys.argv[1] if len(sys.argv) > 1 else "--bot-worker"
         if mode == "--bot-worker":
             asyncio.run(bot_worker_main())
         elif mode == "--server-worker":
             run_ai_worker()
         else:
-            launch_control_panel()
+            raise RuntimeError(
+                "Неизвестный режим запуска. Используй без аргументов, --bot-worker или --server-worker."
+            )
     except KeyboardInterrupt:
         print("\nОстановлено вручную.", flush=True)
     except TelegramUnauthorizedError:

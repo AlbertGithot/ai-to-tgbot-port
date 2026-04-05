@@ -2,15 +2,25 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+.launcher_state.json
 .venv/
 venv/
 
 bot_logs/
 bot_logs_qwen35_pretrained/
+bot_control.db
+bot_control.db-shm
+bot_control.db-wal
 
 models/
 *.gguf
 llama.cpp/
+build/
+dist/
+*.spec
+HeyMate.exe
+build_launcher_exe.bat
+face_target.py
 
 telegram_llama_bot_qwen35_pretrained.py
 telegram_llama_bot_local_config.py

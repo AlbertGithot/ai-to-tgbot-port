@@ -1,0 +1,62 @@
+{% extends "site_dashboard_base.html" %}
+
+{% block title %}HeyMate Control{% endblock %}
+
+{% block content %}
+<main class="landing-grid">
+  <section class="hero-card">
+    <p class="eyebrow">Flask-пульт</p>
+    <h1>Сайт для управления long-think, задачами и JSON-артефактами.</h1>
+    <p class="hero-copy">
+      Панель в реальном времени показывает процессы, фоновые задачи и файлы, которые уже наготовила модель.
+      Если надо, через управление можно отключить внешний доступ к панели или сменить код.
+    </p>
+    <div class="hero-actions">
+      {% if panel_authenticated %}
+        <a class="primary-button" href="{{ url_for('dashboard') }}">Открыть панель</a>
+        <a class="secondary-button" href="{{ url_for('manage') }}">Управление сайтом</a>
+      {% else %}
+        <a class="primary-button" href="#login-card">Ввести код доступа</a>
+        <a class="secondary-button" href="#login-card">Управление сайтом</a>
+      {% endif %}
+    </div>
+    <ul class="feature-list">
+      <li>Текущие процессы проекта</li>
+      <li>Long-think job'ы и их прогресс</li>
+      <li>JSON-файлы с готовыми ответами нейросети</li>
+      <li>Очередь фоновых задач индексации</li>
+    </ul>
+  </section>
+
+  <aside id="login-card" class="login-card">
+    <h2>Код доступа</h2>
+    <p class="muted">
+      Без кода сюда лучше не лезть. Панель и так знает слишком много о том, чем занят бот.
+    </p>
+    {% if panel_authenticated %}
+      <p class="state-line">Сессия уже открыта. Можешь идти командовать.</p>
+      <div class="stacked-actions">
+        <a class="primary-button" href="{{ url_for('dashboard') }}">Перейти в панель</a>
+        <a class="secondary-button" href="{{ url_for('manage') }}">Управление сайтом</a>
+      </div>
+    {% else %}
+      <form class="login-form" method="post" action="{{ url_for('login') }}">
+        <input type="hidden" name="next" value="{{ url_for('dashboard') }}">
+        <label for="access_code">Код доступа</label>
+        <input id="access_code" name="access_code" type="password" placeholder="Введи код" autocomplete="current-password" required>
+        <button class="primary-button" type="submit">Войти в панель</button>
+      </form>
+    {% endif %}
+    <div class="status-box {{ 'status-on' if site_enabled else 'status-off' }}">
+      <strong>{{ 'Панель доступна' if site_enabled else 'Панель выключена' }}</strong>
+      <span>
+        {% if site_enabled %}
+          Дашборд открыт для авторизованной сессии и живёт, пока ты сам его не выключишь.
+        {% else %}
+          Дашборд переведён в закрытый режим. Процесс жив, но наружу торчит только вход и управление.
+        {% endif %}
+      </span>
+    </div>
+  </aside>
+</main>
+{% endblock %}

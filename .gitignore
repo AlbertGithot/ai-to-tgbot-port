@@ -15,6 +15,7 @@ terminal_sessions/
 local_kb/
 project_contexts/
 task_queue/
+web_panel_runtime/
 bot_control.db
 bot_control.db-shm
 bot_control.db-wal

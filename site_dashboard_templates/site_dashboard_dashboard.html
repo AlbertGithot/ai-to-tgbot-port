@@ -1,0 +1,251 @@
+{% extends "site_dashboard_base.html" %}
+
+{% block title %}Панель процессов{% endblock %}
+
+{% block content %}
+<main class="dashboard-layout" data-refresh-seconds="{{ refresh_interval_seconds }}">
+  <section class="dashboard-hero">
+    <div>
+      <p class="eyebrow">Realtime control</p>
+      <h1>Текущие процессы, задачи и JSON-файлы от нейросети.</h1>
+      <p class="muted">
+        Всё ниже обновляется автоматически. Если модель опять творит дичь, это хотя бы видно сразу, а не через полдня страданий.
+      </p>
+    </div>
+    <div class="stacked-actions">
+      <a class="secondary-button" href="{{ url_for('manage') }}">Управление сайтом</a>
+      <button id="refresh-now" class="ghost-button" type="button">Обновить сейчас</button>
+    </div>
+  </section>
+
+  <section class="stats-grid" id="stats-grid">
+    <article class="stat-card">
+      <span>Активные long-think</span>
+      <strong id="stat-active-jobs">{{ overview.stats.active_job_count }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>JSON-файлы</span>
+      <strong id="stat-result-files">{{ overview.stats.result_file_count }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Фоновые задачи</span>
+      <strong id="stat-running-tasks">{{ overview.stats.running_task_count }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Процессы проекта</span>
+      <strong id="stat-processes">{{ overview.stats.process_count }}</strong>
+    </article>
+  </section>
+
+  <section class="panel-grid">
+    <article class="panel-card">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Процессы</p>
+          <h2>Текущие процессы</h2>
+        </div>
+        <span class="muted" id="generated-at">{{ overview.generated_at }}</span>
+      </div>
+      <div id="process-list" class="list-grid"></div>
+    </article>
+
+    <article class="panel-card">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Long-think</p>
+          <h2>Текущие job'ы</h2>
+        </div>
+      </div>
+      <div id="job-list" class="list-grid"></div>
+    </article>
+  </section>
+
+  <section class="panel-grid">
+    <article class="panel-card">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Файлы</p>
+          <h2>JSON, подготовленные нейросеткой</h2>
+        </div>
+      </div>
+      <div id="file-list" class="list-grid"></div>
+    </article>
+
+    <article class="panel-card">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Очередь</p>
+          <h2>Фоновые задачи</h2>
+        </div>
+      </div>
+      <div id="task-list" class="list-grid"></div>
+    </article>
+  </section>
+
+  <section class="panel-card json-viewer-card">
+    <div class="panel-heading">
+      <div>
+        <p class="eyebrow">JSON viewer</p>
+        <h2>Содержимое result.json</h2>
+      </div>
+      <span class="muted">Нажми “Открыть JSON” у нужного файла</span>
+    </div>
+    <pre id="json-viewer" class="json-viewer">{
+  "hint": "Выбери готовый JSON-файл из списка слева."
+}</pre>
+  </section>
+</main>
+
+<script>
+  const initialOverview = {{ overview | tojson }};
+  const refreshSeconds = Number(document.querySelector('.dashboard-layout')?.dataset.refreshSeconds || 4);
+
+  function escapeHtml(value) {
+    return String(value ?? '')
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
+  }
+
+  function badge(status) {
+    const normalized = String(status || 'unknown').toLowerCase();
+    return `<span class="mini-badge badge-${escapeHtml(normalized)}">${escapeHtml(status || 'unknown')}</span>`;
+  }
+
+  function renderProcesses(processes) {
+    const container = document.getElementById('process-list');
+    if (!processes.length) {
+      container.innerHTML = '<div class="empty-state">Пока не нашёл релевантных процессов. Либо всё выключено, либо оно хорошо спряталось.</div>';
+      return;
+    }
+    container.innerHTML = processes.map((process) => `
+      <article class="list-card">
+        <div class="list-row">
+          <strong>PID ${escapeHtml(process.pid)}</strong>
+          <span class="muted">${escapeHtml(process.elapsed)}</span>
+        </div>
+        <div class="list-row">
+          <span>CPU ${escapeHtml(process.cpu_percent)}%</span>
+          <span>RAM ${escapeHtml(process.memory_percent)}%</span>
+        </div>
+        <code>${escapeHtml(process.command)}</code>
+      </article>
+    `).join('');
+  }
+
+  function renderJobs(jobs) {
+    const container = document.getElementById('job-list');
+    if (!jobs.length) {
+      container.innerHTML = '<div class="empty-state">Long-think job\'ов пока нет. Подозрительно тихо.</div>';
+      return;
+    }
+    container.innerHTML = jobs.map((job) => `
+      <article class="list-card">
+        <div class="list-row">
+          <strong>${escapeHtml(job.job_id.slice(0, 8))}</strong>
+          ${badge(job.status)}
+        </div>
+        <p>${escapeHtml(job.request_text || 'Без текста запроса')}</p>
+        <div class="progress-shell">
+          <div class="progress-fill" style="width:${Math.max(0, Math.min(100, Number(job.progress_percent || 0)))}%"></div>
+        </div>
+        <div class="list-row">
+          <span>Фаза: ${escapeHtml(job.phase)}</span>
+          <span>Готово: ${escapeHtml(job.progress_percent)}%</span>
+        </div>
+        <div class="list-row">
+          <span>Итерации: ${escapeHtml(job.completed_iterations)}/${escapeHtml(job.planned_iterations)}</span>
+          <span>Осталось: ${escapeHtml(job.remaining)}</span>
+        </div>
+        ${job.error ? `<div class="danger-line">${escapeHtml(job.error)}</div>` : ''}
+      </article>
+    `).join('');
+  }
+
+  function renderFiles(files) {
+    const container = document.getElementById('file-list');
+    if (!files.length) {
+      container.innerHTML = '<div class="empty-state">Готовых JSON пока нет. Модель ещё не настрочила тебе трофеи.</div>';
+      return;
+    }
+    container.innerHTML = files.map((file) => `
+      <article class="list-card">
+        <div class="list-row">
+          <strong>${escapeHtml(file.job_id.slice(0, 8))}</strong>
+          ${badge(file.status)}
+        </div>
+        <p>${escapeHtml(file.request_text || 'Без текста запроса')}</p>
+        <div class="list-row">
+          <span>Символов: ${escapeHtml(file.character_count)}</span>
+          <span>${file.answer_completed_fully ? 'Ответ закрыт полностью' : 'Ответ может быть неполным'}</span>
+        </div>
+        <code>${escapeHtml(file.path)}</code>
+        <p class="muted">${escapeHtml(file.preview || 'Без превью')}</p>
+        <button class="ghost-button open-json" type="button" data-job-id="${escapeHtml(file.job_id)}">Открыть JSON</button>
+      </article>
+    `).join('');
+    for (const button of container.querySelectorAll('.open-json')) {
+      button.addEventListener('click', async () => {
+        const jobId = button.dataset.jobId;
+        const response = await fetch(`/api/file/${encodeURIComponent(jobId)}`);
+        if (!response.ok) {
+          document.getElementById('json-viewer').textContent = JSON.stringify({ error: 'Не удалось открыть JSON' }, null, 2);
+          return;
+        }
+        const payload = await response.json();
+        document.getElementById('json-viewer').textContent = JSON.stringify(payload.payload, null, 2);
+      });
+    }
+  }
+
+  function renderTasks(tasks) {
+    const container = document.getElementById('task-list');
+    if (!tasks.length) {
+      container.innerHTML = '<div class="empty-state">Очередь задач пока пустая. Редкое зрелище, наслаждайся.</div>';
+      return;
+    }
+    container.innerHTML = tasks.map((task) => `
+      <article class="list-card">
+        <div class="list-row">
+          <strong>${escapeHtml(task.task_id.slice(0, 8))}</strong>
+          ${badge(task.status)}
+        </div>
+        <p>${escapeHtml(task.description || task.kind)}</p>
+        <div class="list-row">
+          <span>${escapeHtml(task.kind)}</span>
+          <span>${escapeHtml(task.progress_current)}/${escapeHtml(task.progress_total || 0)}</span>
+        </div>
+        ${task.progress_label ? `<div class="muted">${escapeHtml(task.progress_label)}</div>` : ''}
+        ${task.error ? `<div class="danger-line">${escapeHtml(task.error)}</div>` : ''}
+      </article>
+    `).join('');
+  }
+
+  function renderOverview(overview) {
+    document.getElementById('stat-active-jobs').textContent = overview.stats.active_job_count;
+    document.getElementById('stat-result-files').textContent = overview.stats.result_file_count;
+    document.getElementById('stat-running-tasks').textContent = overview.stats.running_task_count;
+    document.getElementById('stat-processes').textContent = overview.stats.process_count;
+    document.getElementById('generated-at').textContent = overview.generated_at;
+    renderProcesses(overview.processes || []);
+    renderJobs(overview.long_think_jobs || []);
+    renderFiles(overview.result_files || []);
+    renderTasks(overview.background_tasks || []);
+  }
+
+  async function refreshOverview() {
+    const response = await fetch('/api/overview', { cache: 'no-store' });
+    if (!response.ok) {
+      return;
+    }
+    const overview = await response.json();
+    renderOverview(overview);
+  }
+
+  document.getElementById('refresh-now')?.addEventListener('click', refreshOverview);
+  renderOverview(initialOverview);
+  window.setInterval(refreshOverview, refreshSeconds * 1000);
+</script>
+{% endblock %}

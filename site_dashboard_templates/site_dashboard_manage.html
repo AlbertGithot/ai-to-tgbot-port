@@ -1,0 +1,48 @@
+{% extends "site_dashboard_base.html" %}
+
+{% block title %}Управление сайтом{% endblock %}
+
+{% block content %}
+<main class="manage-layout">
+  <section class="panel-card">
+    <p class="eyebrow">Управление сайтом</p>
+    <h1>Дёргай тумблеры аккуратно.</h1>
+    <p class="muted">
+      Тут можно закрыть или открыть саму панель и поменять код доступа.
+      Выключение прячет сайт в закрытый режим, но сам Flask-процесс не убивает. Иначе ты бы сам себе срубил ветку, гений.
+    </p>
+
+    <div class="manage-state-box {{ 'status-on' if site_enabled else 'status-off' }}">
+      <strong>{{ 'Сайт включён' if site_enabled else 'Сайт выключен' }}</strong>
+      <span>Последняя смена кода доступа: {{ access_code_changed_at }}</span>
+    </div>
+
+    <form class="control-form" method="post">
+      <input type="hidden" name="action" value="toggle-site">
+      <button class="{{ 'danger-button' if site_enabled else 'primary-button' }}" type="submit">
+        {{ 'Выключить сайт' if site_enabled else 'Включить сайт' }}
+      </button>
+    </form>
+  </section>
+
+  <section class="panel-card">
+    <p class="eyebrow">Смена кода</p>
+    <h2>Изменить код доступа</h2>
+    <form class="stack-form" method="post">
+      <input type="hidden" name="action" value="change-access-code">
+      <label for="new_access_code">Новый код</label>
+      <input id="new_access_code" name="new_access_code" type="password" minlength="4" required placeholder="Хотя бы 4 символа">
+      <label for="confirm_access_code">Подтверждение</label>
+      <input id="confirm_access_code" name="confirm_access_code" type="password" minlength="4" required placeholder="Повтори код">
+      <button class="primary-button" type="submit">Сохранить новый код</button>
+    </form>
+    <p class="muted">
+      После смены старый код сразу умрёт. Так что не забудь новый, если не хочешь потом искать его по файлам руками.
+    </p>
+    <div class="stacked-actions">
+      <a class="secondary-button" href="{{ url_for('dashboard') }}">Назад в панель</a>
+      <a class="ghost-link" href="{{ url_for('index') }}">На главную</a>
+    </div>
+  </section>
+</main>
+{% endblock %}

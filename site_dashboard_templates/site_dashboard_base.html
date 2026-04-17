@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}HeyMate Panel{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='site_dashboard.css') }}">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="topbar">
+      <a class="brand" href="{{ url_for('index') }}">
+        <span class="brand-mark">HM</span>
+        <span>
+          <strong>HeyMate Control</strong>
+          <small>панель управления всем этим цирком</small>
+        </span>
+      </a>
+      <div class="topbar-actions">
+        <span class="state-pill {{ 'is-on' if site_enabled else 'is-off' }}">
+          {{ 'Сайт включён' if site_enabled else 'Сайт выключен' }}
+        </span>
+        {% if panel_authenticated %}
+          <a class="ghost-link" href="{{ url_for('dashboard') }}">Панель</a>
+          <a class="ghost-link" href="{{ url_for('manage') }}">Управление сайтом</a>
+          <form method="post" action="{{ url_for('logout') }}">
+            <button class="ghost-button" type="submit">Выйти</button>
+          </form>
+        {% endif %}
+      </div>
+    </header>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <section class="flash-stack">
+          {% for category, message in messages %}
+            <div class="flash flash-{{ category }}">{{ message }}</div>
+          {% endfor %}
+        </section>
+      {% endif %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>

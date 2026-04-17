@@ -1,0 +1,7 @@
+* text=auto
+*.sh text eol=lf
+HeyMate text eol=lf
+*.py text eol=lf
+README.md text eol=lf
+.env.example text eol=lf
+requirements.txt text eol=lf

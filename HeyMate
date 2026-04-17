@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+PROJECT_DIR="$SCRIPT_DIR"
+INVOKE_CWD="$(pwd)"
+
+REPO_URL="${HEYMATE_REPO_URL:-https://github.com/AlbertGithot/ai-to-tgbot-port.git}"
+REPO_BRANCH="${HEYMATE_REPO_BRANCH:-linux}"
+REPO_ARCHIVE_URL="${HEYMATE_REPO_ARCHIVE_URL:-https://codeload.github.com/AlbertGithot/ai-to-tgbot-port/tar.gz/refs/heads/${REPO_BRANCH}}"
+INSTALL_DIR="${HEYMATE_INSTALL_DIR:-$SCRIPT_DIR/ai-to-tgbot-port}"
+AUTO_UPDATE="${HEYMATE_AUTO_UPDATE:-0}"
+
+find_python() {
+  if command -v python3 >/dev/null 2>&1; then
+    echo "python3"
+    return 0
+  fi
+  if command -v python >/dev/null 2>&1; then
+    echo "python"
+    return 0
+  fi
+  echo "Python 3 was not found. Install python3 and run HeyMate again." >&2
+  return 1
+}
+
+is_project_dir() {
+  local dir="$1"
+  [[ -f "$dir/launcher_cli.py" && -f "$dir/bot.py" ]]
+}
+
+download_archive() {
+  local url="$1"
+  local out="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -L --fail --progress-bar "$url" -o "$out"
+    return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -O "$out" "$url"
+    return 0
+  fi
+  echo "Neither curl nor wget is available. Install one of them or clone the repository manually." >&2
+  return 1
+}
+
+bootstrap_project() {
+  local target_dir="$1"
+  local target_parent
+  target_parent="$(dirname "$target_dir")"
+  mkdir -p "$target_parent"
+
+  if [[ -d "$target_dir" ]]; then
+    if is_project_dir "$target_dir"; then
+      PROJECT_DIR="$target_dir"
+      return 0
+    fi
+    echo "Target directory already exists but does not look like a valid HeyMate Linux package:" >&2
+    echo "$target_dir" >&2
+    echo "Move it away, remove it, or set HEYMATE_INSTALL_DIR to another location." >&2
+    return 1
+  fi
+
+  echo "Bootstrapping the Linux package into:" >&2
+  echo "$target_dir" >&2
+
+  if command -v git >/dev/null 2>&1; then
+    git clone --branch "$REPO_BRANCH" --single-branch "$REPO_URL" "$target_dir"
+    PROJECT_DIR="$target_dir"
+    return 0
+  fi
+
+  local temp_dir archive_path extracted_root
+  temp_dir="$(mktemp -d)"
+  archive_path="$temp_dir/repo.tar.gz"
+  trap 'rm -rf "$temp_dir"' RETURN
+
+  download_archive "$REPO_ARCHIVE_URL" "$archive_path"
+  tar -xzf "$archive_path" -C "$temp_dir"
+
+  extracted_root="$(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+  if [[ -z "$extracted_root" ]]; then
+    echo "Failed to extract the Linux package archive." >&2
+    return 1
+  fi
+
+  mv "$extracted_root" "$target_dir"
+  PROJECT_DIR="$target_dir"
+}
+
+update_project() {
+  local target_dir="$1"
+
+  if [[ "$AUTO_UPDATE" != "1" ]]; then
+    return 0
+  fi
+
+  if ! is_project_dir "$target_dir"; then
+    return 0
+  fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    echo "git was not found, skipping Linux package auto-update." >&2
+    return 0
+  fi
+
+  if [[ ! -d "$target_dir/.git" ]]; then
+    echo "Installed Linux package is not a git clone, skipping auto-update." >&2
+    return 0
+  fi
+
+  if ! git -C "$target_dir" diff --quiet --ignore-submodules HEAD -- 2>/dev/null; then
+    echo "Local changes detected in the Linux package, skipping auto-update." >&2
+    return 0
+  fi
+
+  echo "Checking for Linux package updates..." >&2
+
+  if ! git -C "$target_dir" fetch --depth 1 origin "$REPO_BRANCH" >/dev/null 2>&1; then
+    echo "Could not fetch updates for the Linux package. Continuing with the local copy." >&2
+    return 0
+  fi
+
+  local current_branch
+  current_branch="$(git -C "$target_dir" symbolic-ref --short HEAD 2>/dev/null || true)"
+  if [[ "$current_branch" != "$REPO_BRANCH" ]]; then
+    if ! git -C "$target_dir" checkout "$REPO_BRANCH" >/dev/null 2>&1; then
+      echo "Could not switch the package to branch '$REPO_BRANCH'. Continuing with the current checkout." >&2
+      return 0
+    fi
+  fi
+
+  if git -C "$target_dir" merge --ff-only "origin/$REPO_BRANCH" >/dev/null 2>&1; then
+    echo "Linux package is up to date." >&2
+  else
+    echo "Could not fast-forward the Linux package. Continuing with the local copy." >&2
+  fi
+}
+
+if is_project_dir "$PROJECT_DIR"; then
+  update_project "$PROJECT_DIR"
+else
+  bootstrap_project "$INSTALL_DIR"
+  update_project "$PROJECT_DIR"
+fi
+
+PYTHON_CMD="$(find_python)"
+cd "$PROJECT_DIR"
+export HEYMATE_INVOKE_CWD="$INVOKE_CWD"
+exec "$PYTHON_CMD" "$PROJECT_DIR/launcher_cli.py" "$@"

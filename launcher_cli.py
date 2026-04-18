@@ -38,6 +38,7 @@ BOT_ENTRYPOINT = "bot.py"
 SITE_DASHBOARD_ENTRYPOINT = "site_dashboard.py"
 UI_STEP_DELAY_SECONDS = 1.0
 SYSTEMD_SERVICE_NAME = "heymate-bot.service"
+SITE_DASHBOARD_SYSTEMD_SERVICE_NAME = "heymate-site-dashboard.service"
 TERMINAL_SESSIONS_DIR_NAME = "terminal_sessions"
 SITE_DASHBOARD_RUNTIME_DIR_NAME = "web_panel_runtime"
 SITE_DASHBOARD_STATE_FILE_NAME = "panel_state.json"
@@ -948,6 +949,122 @@ def show_site_dashboard_log(project_root: Path) -> None:
     pause()
 
 
+def install_site_dashboard_systemd_service(project_root: Path) -> None:
+    cls()
+    context = get_systemd_context(SITE_DASHBOARD_SYSTEMD_SERVICE_NAME)
+    if context is None:
+        print("systemctl не найден. На этой системе некуда ставить service для веб-панели.\n", flush=True)
+        pause()
+        return
+
+    command_prefix, service_path, mode = context
+    service_path.parent.mkdir(parents=True, exist_ok=True)
+    service_path.write_text(
+        build_site_dashboard_systemd_service_text(project_root, mode),
+        encoding="utf-8",
+    )
+
+    daemon_reload = subprocess.run([*command_prefix, "daemon-reload"], check=False)
+    enable_now = subprocess.run(
+        [*command_prefix, "enable", "--now", SITE_DASHBOARD_SYSTEMD_SERVICE_NAME],
+        check=False,
+    )
+
+    if daemon_reload.returncode != 0 or enable_now.returncode != 0:
+        print("Не удалось включить systemd service для веб-панели. Проверь вывод выше.\n", flush=True)
+        pause()
+        return
+
+    print(f"Service веб-панели установлен: {service_path}", flush=True)
+    print(f"Панель должна жить тут: {load_site_dashboard_settings(project_root)['url']}\n", flush=True)
+    if mode == "user":
+        print(
+            "Если это headless Linux-сервер, может понадобиться loginctl enable-linger $USER.\n",
+            flush=True,
+        )
+    pause()
+
+
+def show_site_dashboard_systemd_status() -> None:
+    cls()
+    context = get_systemd_context(SITE_DASHBOARD_SYSTEMD_SERVICE_NAME)
+    if context is None:
+        print("systemctl не найден.\n", flush=True)
+        pause()
+        return
+
+    command_prefix, _, _ = context
+    subprocess.run(
+        [*command_prefix, "status", SITE_DASHBOARD_SYSTEMD_SERVICE_NAME, "--no-pager", "--full"],
+        check=False,
+    )
+    print("", flush=True)
+    pause()
+
+
+def manage_site_dashboard_systemd_service(action: str) -> None:
+    cls()
+    context = get_systemd_context(SITE_DASHBOARD_SYSTEMD_SERVICE_NAME)
+    if context is None:
+        print("systemctl не найден.\n", flush=True)
+        pause()
+        return
+
+    command_prefix, _, _ = context
+    completed = subprocess.run(
+        [*command_prefix, action, SITE_DASHBOARD_SYSTEMD_SERVICE_NAME],
+        check=False,
+    )
+    if completed.returncode == 0:
+        print(f"systemd service веб-панели action completed: {action}\n", flush=True)
+    else:
+        print(f"Не удалось выполнить action '{action}' для systemd service веб-панели.\n", flush=True)
+    pause()
+
+
+def show_site_dashboard_systemd_logs(project_root: Path) -> None:
+    cls()
+    context = get_systemd_context(SITE_DASHBOARD_SYSTEMD_SERVICE_NAME)
+    journalctl = shutil.which("journalctl")
+
+    if context is not None and journalctl:
+        command_prefix, _, mode = context
+        journal_command = [journalctl]
+        if mode == "user":
+            journal_command.append("--user")
+        journal_command.extend(
+            ["-u", SITE_DASHBOARD_SYSTEMD_SERVICE_NAME, "-n", "200", "--no-pager"]
+        )
+        subprocess.run(journal_command, check=False)
+        print("", flush=True)
+        pause()
+        return
+
+    print("=== site_dashboard.log ===", flush=True)
+    print(read_text_tail(site_dashboard_log_path(project_root)), flush=True)
+    pause()
+
+
+def remove_site_dashboard_systemd_service() -> None:
+    cls()
+    context = get_systemd_context(SITE_DASHBOARD_SYSTEMD_SERVICE_NAME)
+    if context is None:
+        print("systemctl не найден.\n", flush=True)
+        pause()
+        return
+
+    command_prefix, service_path, _ = context
+    subprocess.run(
+        [*command_prefix, "disable", "--now", SITE_DASHBOARD_SYSTEMD_SERVICE_NAME],
+        check=False,
+    )
+    if service_path.is_file():
+        service_path.unlink()
+    subprocess.run([*command_prefix, "daemon-reload"], check=False)
+    print("systemd service веб-панели удалён.\n", flush=True)
+    pause()
+
+
 def list_recent_problem_long_think_jobs(project_root: Path, limit: int = 3) -> list[dict[str, Any]]:
     root = project_root / "deep_think_jobs"
     if not root.is_dir():
@@ -1111,6 +1228,7 @@ def build_port_manual_text() -> str:
         "- Проекты: индексация папок, просмотр деталей, перескан и удаление индексов.\n"
         "- Фоновые задачи: история очереди и чистка хвостов после индексации.\n"
         "- Веб-панель: запуск в фоне, статус, лог и открытие в браузере.\n"
+        "- Веб-панель через systemd: отдельный сервис, чтобы Flask-пульт жил независимо от SSH-сессии.\n"
         "- Менеджер моделей: список найденных .gguf, быстрая активация, удаление и настройка env.\n"
         "- Проверка обновления и установка новой версии.\n"
         "- Анализ живых long-think/systemd процессов перед установкой обновления.\n"
@@ -3452,17 +3570,17 @@ def activate_existing_model_from_launcher(project_root: Path, state: dict[str, A
     apply_selected_model(project_root, state, models[choice - 1])
 
 
-def get_systemd_context() -> tuple[list[str], Path, str] | None:
+def get_systemd_context(service_name: str = SYSTEMD_SERVICE_NAME) -> tuple[list[str], Path, str] | None:
     systemctl = shutil.which("systemctl")
     if not systemctl:
         return None
 
     if hasattr(os, "geteuid") and os.geteuid() == 0:
-        return [systemctl], Path("/etc/systemd/system") / SYSTEMD_SERVICE_NAME, "system"
+        return [systemctl], Path("/etc/systemd/system") / service_name, "system"
 
     return (
         [systemctl, "--user"],
-        Path.home() / ".config" / "systemd" / "user" / SYSTEMD_SERVICE_NAME,
+        Path.home() / ".config" / "systemd" / "user" / service_name,
         "user",
     )
 
@@ -3493,6 +3611,44 @@ def build_systemd_service_text(project_root: Path, mode: str) -> str:
         TimeoutStopSec=45
         KillMode=control-group
         SyslogIdentifier=heymate-bot
+        StandardOutput=journal
+        StandardError=journal
+
+        [Install]
+        WantedBy={wanted_by}
+        """
+    ).strip() + "\n"
+
+
+def build_site_dashboard_systemd_service_text(project_root: Path, mode: str) -> str:
+    python_bin = python_command()[0]
+    python_bin = shutil.which(python_bin) or python_bin
+    dashboard_path = project_root / SITE_DASHBOARD_ENTRYPOINT
+    wanted_by = "multi-user.target" if mode == "system" else "default.target"
+    settings = load_site_dashboard_settings(project_root)
+
+    return textwrap.dedent(
+        f"""
+        [Unit]
+        Description=HeyMate site dashboard
+        After=network-online.target
+        Wants=network-online.target
+        StartLimitIntervalSec=300
+        StartLimitBurst=20
+
+        [Service]
+        Type=simple
+        WorkingDirectory={project_root}
+        Environment=PYTHONUNBUFFERED=1
+        Environment=SITE_DASHBOARD_HOST={settings['host']}
+        Environment=SITE_DASHBOARD_PORT={settings['port']}
+        Environment=SITE_DASHBOARD_REFRESH_SECONDS={settings['refresh_seconds']}
+        ExecStart="{python_bin}" "{dashboard_path}"
+        Restart=always
+        RestartSec=5
+        TimeoutStopSec=30
+        KillMode=control-group
+        SyslogIdentifier=heymate-site-dashboard
         StandardOutput=journal
         StandardError=journal
 
@@ -3731,6 +3887,7 @@ def site_dashboard_menu(project_root: Path) -> None:
                 "Запустить и открыть в браузере",
                 "Показать статус и адрес",
                 "Показать лог веб-панели",
+                "Управление systemd service веб-панели",
                 "Остановить веб-панель",
                 "Назад",
             ],
@@ -3744,7 +3901,49 @@ def site_dashboard_menu(project_root: Path) -> None:
         elif choice == 4:
             show_site_dashboard_log(project_root)
         elif choice == 5:
+            site_dashboard_systemd_menu(project_root)
+        elif choice == 6:
             stop_site_dashboard(project_root)
+        else:
+            return
+
+
+def site_dashboard_systemd_menu(project_root: Path) -> None:
+    while True:
+        cls()
+        print_block(
+            """
+            Отдельный systemd-загон для веб-панели.
+            Если хочешь, чтобы Flask-пульт жил сам по себе после выхода из SSH, тебе сюда.
+            """
+        )
+        choice = prompt_choice(
+            "systemd: веб-панель",
+            [
+                "Установить или обновить service веб-панели",
+                "Запустить service веб-панели",
+                "Остановить service веб-панели",
+                "Перезапустить service веб-панели",
+                "Посмотреть статус service веб-панели",
+                "Посмотреть логи service веб-панели",
+                "Удалить service веб-панели",
+                "Назад",
+            ],
+        )
+        if choice == 1:
+            install_site_dashboard_systemd_service(project_root)
+        elif choice == 2:
+            manage_site_dashboard_systemd_service("start")
+        elif choice == 3:
+            manage_site_dashboard_systemd_service("stop")
+        elif choice == 4:
+            manage_site_dashboard_systemd_service("restart")
+        elif choice == 5:
+            show_site_dashboard_systemd_status()
+        elif choice == 6:
+            show_site_dashboard_systemd_logs(project_root)
+        elif choice == 7:
+            remove_site_dashboard_systemd_service()
         else:
             return
 

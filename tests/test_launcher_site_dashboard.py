@@ -73,6 +73,34 @@ class LauncherSiteDashboardTests(unittest.TestCase):
         self.assertFalse(status["running"])
         self.assertFalse(process_state_path.exists())
 
+    def test_build_site_dashboard_systemd_service_text_contains_exec_and_env(self) -> None:
+        (self.project_root / launcher_cli.ENV_FILE_NAME).write_text(
+            "\n".join(
+                [
+                    "SITE_DASHBOARD_HOST=127.0.0.1",
+                    "SITE_DASHBOARD_PORT=6061",
+                    "SITE_DASHBOARD_REFRESH_SECONDS=11",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch("launcher_cli.python_command", return_value=["python3"]), mock.patch(
+            "launcher_cli.shutil.which",
+            side_effect=lambda value: "/usr/bin/python3" if value == "python3" else None,
+        ):
+            service_text = launcher_cli.build_site_dashboard_systemd_service_text(
+                self.project_root,
+                "system",
+            )
+
+        self.assertIn('ExecStart="/usr/bin/python3" "', service_text)
+        self.assertIn("site_dashboard.py", service_text)
+        self.assertIn("Environment=SITE_DASHBOARD_HOST=127.0.0.1", service_text)
+        self.assertIn("Environment=SITE_DASHBOARD_PORT=6061", service_text)
+        self.assertIn("Environment=SITE_DASHBOARD_REFRESH_SECONDS=11", service_text)
+        self.assertIn("WantedBy=multi-user.target", service_text)
+
 
 if __name__ == "__main__":
     unittest.main()

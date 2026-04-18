@@ -1465,12 +1465,34 @@ def current_git_head_sha(project_root: Path, ref: str = "HEAD") -> str:
 
 def git_has_local_changes(project_root: Path) -> bool:
     completed = run_capture_command(
-        ["git", "diff", "--quiet", "--ignore-submodules", "HEAD", "--"],
+        ["git", "status", "--porcelain=v1", "--untracked-files=normal"],
         cwd=project_root,
     )
     if completed is None:
         return False
-    return completed.returncode != 0
+    return bool((completed.stdout or "").strip())
+
+
+def git_remote_can_fast_forward_current_branch(project_root: Path, branch: str) -> bool | None:
+    completed = run_capture_command(
+        ["git", "merge-base", "--is-ancestor", "HEAD", f"{GIT_REMOTE_NAME}/{branch}"],
+        cwd=project_root,
+    )
+    if completed is None:
+        return None
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1:
+        return False
+    return None
+
+
+def realign_current_branch_to_remote_snapshot(project_root: Path, branch: str) -> subprocess.CompletedProcess[str] | None:
+    return run_capture_command(
+        ["git", "checkout", "-B", branch, f"{GIT_REMOTE_NAME}/{branch}"],
+        cwd=project_root,
+        timeout=60,
+    )
 
 
 def git_remote_url(project_root: Path, remote_name: str = GIT_REMOTE_NAME) -> str:
@@ -1691,6 +1713,38 @@ def install_project_update(project_root: Path, update_info: dict[str, Any]) -> b
         )
         return False
 
+    can_fast_forward = git_remote_can_fast_forward_current_branch(project_root, branch)
+    if can_fast_forward is False:
+        if git_has_local_changes(project_root):
+            print_live_banner(
+                "Идет загрузка",
+                f"Ветка {branch} была переписана, но локальное git-дерево не чистое.",
+                progress=1.0,
+                final_newline=True,
+            )
+            return False
+        print_live_banner(
+            "Идет загрузка",
+            f"Ветка {branch} была переписана. Пересинхронизирую snapshot...",
+            progress=0.82,
+        )
+        reset_completed = realign_current_branch_to_remote_snapshot(project_root, branch)
+        if reset_completed is None or reset_completed.returncode != 0:
+            print_live_banner(
+                "Идет загрузка",
+                f"Обновляю ветку {branch}. Скачалось: snapshot-sync не удался.",
+                progress=1.0,
+                final_newline=True,
+            )
+            return False
+        print_live_banner(
+            "Идет загрузка",
+            f"Ветка {branch} пересинхронизирована по remote snapshot.",
+            done=True,
+            final_newline=True,
+        )
+        return True
+
     print_live_banner(
         "Идет загрузка",
         f"Обновляю ветку {branch}. Скачалось: fetch готов, применяю update...",
@@ -1806,7 +1860,8 @@ def handle_project_update_status(
     if not install_project_update(project_root, update_status):
         print(
             "Не удалось установить обновление. "
-            "Проверь сеть, права и чистоту git-дерева.\n",
+            "Проверь сеть, права и чистоту git-дерева. "
+            "Если ветку переписывали или перезаливали заново, локальных изменений быть не должно вообще.\n",
             flush=True,
         )
         return

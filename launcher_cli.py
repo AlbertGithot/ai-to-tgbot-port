@@ -47,6 +47,26 @@ SITE_DASHBOARD_LOG_FILE_NAME = "site_dashboard.log"
 SITE_DASHBOARD_DEFAULT_HOST = "0.0.0.0"
 SITE_DASHBOARD_DEFAULT_PORT = 5080
 SITE_DASHBOARD_DEFAULT_REFRESH_SECONDS = 4
+MODEL_SCAN_COMMON_ROOT_LIMIT = 200
+MODEL_SCAN_SYSTEM_ROOT_LIMIT = 800
+MODEL_SCAN_SKIP_DIR_NAMES = {
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    "node_modules",
+    "venv",
+    ".venv",
+    "env",
+    ".mypy_cache",
+    ".pytest_cache",
+}
+MODEL_SCAN_SKIP_ABSOLUTE_PREFIXES = (
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+)
 GIT_REMOTE_NAME = "origin"
 UPDATE_CHECK_TIMEOUT_SECONDS = 20
 LIVE_STATUS_BAR_WIDTH = 22
@@ -2002,6 +2022,85 @@ def iter_common_model_roots(project_root: Path) -> list[Path]:
     return unique
 
 
+def iter_system_model_roots(project_root: Path) -> list[Path]:
+    roots: list[Path] = []
+    if os.name == "nt":
+        anchor = Path.home().anchor
+        if anchor:
+            roots.append(Path(anchor))
+        roots.append(project_root.anchor and Path(project_root.anchor) or project_root)
+    else:
+        roots.append(Path("/"))
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except Exception:
+            continue
+        marker = str(resolved).lower()
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(resolved)
+    return unique
+
+
+def should_skip_model_scan_dir(path: Path, *, system_wide: bool) -> bool:
+    name = path.name.lower()
+    if name in MODEL_SCAN_SKIP_DIR_NAMES:
+        return True
+    try:
+        if path.is_symlink():
+            return True
+    except OSError:
+        return True
+    if not system_wide:
+        return False
+    path_text = str(path)
+    if os.name != "nt":
+        if any(path_text == prefix or path_text.startswith(prefix + os.sep) for prefix in MODEL_SCAN_SKIP_ABSOLUTE_PREFIXES):
+            return True
+    return False
+
+
+def collect_gguf_candidates_under_root(root: Path, *, limit: int, system_wide: bool) -> list[Path]:
+    if root.is_file():
+        return [root.resolve()] if root.suffix.lower() == ".gguf" else []
+    if not root.is_dir():
+        return []
+
+    matches: list[Path] = []
+    try:
+        walk_root = root.resolve()
+    except Exception:
+        walk_root = root
+
+    try:
+        for current_dir, dirnames, filenames in os.walk(walk_root, topdown=True, onerror=lambda _exc: None, followlinks=False):
+            current_path = Path(current_dir)
+            dirnames[:] = [
+                dirname
+                for dirname in dirnames
+                if not should_skip_model_scan_dir(current_path / dirname, system_wide=system_wide)
+            ]
+            for filename in filenames:
+                if not filename.lower().endswith(".gguf"):
+                    continue
+                candidate = current_path / filename
+                try:
+                    resolved = candidate.resolve()
+                except Exception:
+                    resolved = candidate
+                matches.append(resolved)
+                if len(matches) >= limit:
+                    return matches
+    except Exception:
+        return matches
+    return matches
+
+
 def score_model_candidate(path: Path) -> tuple[int, int, str]:
     name = path.name.lower()
     score = 0
@@ -2042,15 +2141,23 @@ def find_external_model_paths(project_root: Path) -> list[Path]:
         matches.append((score_model_candidate(env_candidate), env_candidate))
 
     for root in iter_common_model_roots(project_root):
-        if root.is_file() and root.suffix.lower() == ".gguf":
-            marker = model_identity_key(root)
-            if marker not in seen:
-                seen.add(marker)
-                matches.append((score_model_candidate(root), root))
-            continue
-        if not root.is_dir():
-            continue
-        for candidate in itertools.islice(root.rglob("*.gguf"), 200):
+        for candidate in collect_gguf_candidates_under_root(
+            root,
+            limit=MODEL_SCAN_COMMON_ROOT_LIMIT,
+            system_wide=False,
+        ):
+            marker = model_identity_key(candidate)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            matches.append((score_model_candidate(candidate), candidate))
+
+    for root in iter_system_model_roots(project_root):
+        for candidate in collect_gguf_candidates_under_root(
+            root,
+            limit=MODEL_SCAN_SYSTEM_ROOT_LIMIT,
+            system_wide=True,
+        ):
             marker = model_identity_key(candidate)
             if marker in seen:
                 continue
@@ -2217,7 +2324,7 @@ def choose_model_path(project_root: Path) -> Path:
         model_path = resolve_model_input_path(raw_path, project_root)
         if model_path is not None:
             return model_path
-        nearby = find_external_model_paths(project_root)[:5]
+        nearby = detected_models[:5]
         print("Не вижу .gguf по этому пути. Можно вставить путь к файлу или к каталогу, где лежит одна модель.", flush=True)
         if nearby:
             print("Вот что я сейчас вижу рядом:", flush=True)

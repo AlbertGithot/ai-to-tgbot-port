@@ -24,6 +24,7 @@ This is not a single script drop. It includes:
 * model discovery and selection;
 * `llama.cpp` discovery or download;
 * the Telegram bot runtime;
+* an optional local Flask dashboard for Linux administration;
 * a local SQLite helper layer;
 * `systemd` integration for production-style Linux usage.
 
@@ -53,7 +54,13 @@ Files:
   * inspect Linux hardware and derive safe runtime defaults;
   * generate and update `.env`;
   * launch the bot in the foreground;
+  * launch and manage the local web dashboard;
   * install, start, stop, restart, inspect, and remove a `systemd` service.
+
+* `site_dashboard.py`
+  Optional local Flask control dashboard. It is intended for Linux administration,
+  long-think job visibility, and process inspection. By default it binds to
+  `127.0.0.1`, not to all interfaces.
 
 * `bot.py`
   Main Telegram bot runtime. It:
@@ -152,6 +159,7 @@ What the launcher does:
 * creates or updates `.env`;
 * can install a `systemd` service;
 * can launch the bot directly.
+* keeps the web dashboard on loopback by default unless you explicitly expose it.
 
 ## Configuration
 
@@ -204,6 +212,15 @@ Important variables:
 * `LLAMA_SERVER_RESTART_DELAY_SECONDS`
   Delay between restart attempts.
 
+* `SITE_DASHBOARD_HOST`
+  Flask dashboard bind address. The safe default is `127.0.0.1`.
+
+* `SITE_DASHBOARD_PORT`
+  Flask dashboard port.
+
+* `SITE_DASHBOARD_REFRESH_SECONDS`
+  Dashboard refresh interval.
+
 ## Operational Notes
 
 Runtime artifacts are local and should not be committed:
@@ -225,3 +242,4 @@ Linux-specific note:
 * if the package is installed as a git clone, `HeyMate` attempts a safe auto-update before launch;
 * once setup is complete, use the `systemd` options from the launcher for long-running service management;
 * for server deployments, `systemd` is the intended path instead of `screen`.
+* the dashboard binds to loopback by default; expose it to the network only deliberately and only behind sane firewall rules.

@@ -14,6 +14,13 @@ class LauncherSiteDashboardTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_load_site_dashboard_settings_defaults_to_loopback(self) -> None:
+        settings = launcher_cli.load_site_dashboard_settings(self.project_root)
+
+        self.assertEqual(settings["host"], "127.0.0.1")
+        self.assertEqual(settings["listen_url"], "http://127.0.0.1:5080")
+        self.assertEqual(settings["url"], "http://127.0.0.1:5080")
+
     def test_load_site_dashboard_settings_uses_env_file(self) -> None:
         (self.project_root / launcher_cli.ENV_FILE_NAME).write_text(
             "\n".join(

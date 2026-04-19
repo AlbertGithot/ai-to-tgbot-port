@@ -5,7 +5,8 @@ import json
 import os
 import secrets
 import subprocess
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -28,9 +29,14 @@ TEMPLATES_ROOT = PROJECT_ROOT / "site_dashboard_templates"
 STATIC_ROOT = PROJECT_ROOT / "site_dashboard_static"
 RUNTIME_ROOT = PROJECT_ROOT / "web_panel_runtime"
 DEFAULT_STATE_PATH = RUNTIME_ROOT / "panel_state.json"
-DEFAULT_HOST = os.getenv("SITE_DASHBOARD_HOST", "0.0.0.0").strip() or "0.0.0.0"
+DEFAULT_HOST = os.getenv("SITE_DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
 DEFAULT_PORT = int(os.getenv("SITE_DASHBOARD_PORT", "5080").strip() or "5080")
 REFRESH_INTERVAL_SECONDS = max(2, int(os.getenv("SITE_DASHBOARD_REFRESH_SECONDS", "4") or "4"))
+ACCESS_CODE_TOKEN_BYTES = 12
+MIN_ACCESS_CODE_LENGTH = 12
+LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
+LOGIN_FAILURE_LIMIT = 8
+LOGIN_LOCKOUT_SECONDS = 5 * 60
 SITE_PROCESS_KEYWORDS = (
     "site_dashboard.py",
     "bot.py",
@@ -67,8 +73,12 @@ def hash_access_code(access_code: str) -> str:
     return hashlib.sha256(access_code.encode("utf-8")).hexdigest()
 
 
+def generate_access_code() -> str:
+    return secrets.token_urlsafe(ACCESS_CODE_TOKEN_BYTES)
+
+
 def default_panel_state(access_code: str | None = None) -> tuple[dict[str, Any], str]:
-    generated_code = access_code or secrets.token_hex(4)
+    generated_code = access_code or generate_access_code()
     state = {
         "site_enabled": True,
         "access_code_hash": hash_access_code(generated_code),
@@ -128,6 +138,57 @@ def is_panel_authenticated() -> bool:
 
 def verify_access_code(state: dict[str, Any], access_code: str) -> bool:
     return bool(access_code) and hash_access_code(access_code.strip()) == str(state.get("access_code_hash") or "")
+
+
+def get_client_identity() -> str:
+    forwarded_for = str(request.headers.get("X-Forwarded-For") or "").strip()
+    if forwarded_for:
+        return forwarded_for.split(",", 1)[0].strip() or "unknown"
+    return str(request.remote_addr or "unknown").strip() or "unknown"
+
+
+def prune_login_failures(store: dict[str, dict[str, float]], now: float | None = None) -> None:
+    current_time = now if now is not None else time.time()
+    stale_keys = [
+        client_id
+        for client_id, payload in store.items()
+        if current_time - float(payload.get("updated_at") or 0.0) > LOGIN_FAILURE_WINDOW_SECONDS
+    ]
+    for client_id in stale_keys:
+        store.pop(client_id, None)
+
+
+def register_failed_login(store: dict[str, dict[str, float]], client_id: str, now: float | None = None) -> None:
+    current_time = now if now is not None else time.time()
+    prune_login_failures(store, current_time)
+    payload = store.get(client_id, {"count": 0.0, "updated_at": current_time, "blocked_until": 0.0})
+    count = int(payload.get("count") or 0) + 1
+    blocked_until = float(payload.get("blocked_until") or 0.0)
+    if count >= LOGIN_FAILURE_LIMIT:
+        blocked_until = current_time + LOGIN_LOCKOUT_SECONDS
+    store[client_id] = {
+        "count": float(count),
+        "updated_at": current_time,
+        "blocked_until": blocked_until,
+    }
+
+
+def clear_failed_login(store: dict[str, dict[str, float]], client_id: str) -> None:
+    store.pop(client_id, None)
+
+
+def get_login_block_remaining_seconds(
+    store: dict[str, dict[str, float]],
+    client_id: str,
+    now: float | None = None,
+) -> int:
+    current_time = now if now is not None else time.time()
+    prune_login_failures(store, current_time)
+    payload = store.get(client_id) or {}
+    blocked_until = float(payload.get("blocked_until") or 0.0)
+    if blocked_until <= current_time:
+        return 0
+    return int(blocked_until - current_time + 0.999)
 
 
 def parse_iso_datetime(value: Any) -> datetime | None:
@@ -343,6 +404,7 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
     root = (project_root or PROJECT_ROOT).resolve()
     panel_state_path = state_path or (root / "web_panel_runtime" / "panel_state.json")
     panel_state, generated_code = ensure_panel_state(panel_state_path)
+    login_failures: dict[str, dict[str, float]] = {}
 
     app = Flask(
         __name__,
@@ -353,7 +415,20 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
     app.config["PROJECT_ROOT"] = root
     app.config["PANEL_STATE_PATH"] = panel_state_path
     app.config["REFRESH_INTERVAL_SECONDS"] = REFRESH_INTERVAL_SECONDS
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+    app.config["SESSION_COOKIE_NAME"] = "heymate_panel"
+    app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
     app.secret_key = panel_state["session_secret"]
+
+    def require_enabled_site():
+        state = load_panel_state(app.config["PANEL_STATE_PATH"])
+        if bool(state.get("site_enabled", True)):
+            return None
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "error": "site_disabled"}), 403
+        flash("Панель сейчас выключена. Включи её сначала в manage-разделе.", "error")
+        return redirect(url_for("manage"))
 
     @app.context_processor
     def inject_global_state() -> dict[str, Any]:
@@ -375,12 +450,23 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
     @app.post("/login")
     def login():
         state = load_panel_state(app.config["PANEL_STATE_PATH"])
+        client_id = get_client_identity()
+        lock_remaining = get_login_block_remaining_seconds(login_failures, client_id)
+        if lock_remaining > 0:
+            flash(
+                f"Слишком много неудачных попыток входа. Подожди {lock_remaining} сек. и попробуй ещё раз.",
+                "error",
+            )
+            return redirect(url_for("index"))
         access_code = request.form.get("access_code", "").strip()
         if verify_access_code(state, access_code):
+            clear_failed_login(login_failures, client_id)
             session["panel_authenticated"] = True
+            session.permanent = True
             flash("Код доступа принят. Теперь можно крутить эту панель как хочешь.", "success")
             target = request.form.get("next") or url_for("dashboard")
             return redirect(target)
+        register_failed_login(login_failures, client_id)
         flash("Код доступа мимо кассы. Проверь, что вводишь, а не набор боли.", "error")
         return redirect(url_for("index"))
 
@@ -409,8 +495,11 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
             if action == "change-access-code":
                 new_code = request.form.get("new_access_code", "").strip()
                 confirm_code = request.form.get("confirm_access_code", "").strip()
-                if len(new_code) < 4:
-                    flash("Код доступа слишком короткий. Не позорься, хотя бы 4 символа.", "error")
+                if len(new_code) < MIN_ACCESS_CODE_LENGTH:
+                    flash(
+                        f"Код доступа слишком короткий. Нужен минимум {MIN_ACCESS_CODE_LENGTH} символов.",
+                        "error",
+                    )
                 elif new_code != confirm_code:
                     flash("Подтверждение не совпало. Даже два поля между собой не договорились.", "error")
                 else:
@@ -431,6 +520,9 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
     @app.get("/dashboard")
     @login_required
     def dashboard():
+        blocked = require_enabled_site()
+        if blocked is not None:
+            return blocked
         state = load_panel_state(app.config["PANEL_STATE_PATH"])
         overview = build_overview_payload(app.config["PROJECT_ROOT"])
         return render_template(
@@ -443,6 +535,9 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
     @app.get("/api/overview")
     @login_required
     def api_overview():
+        blocked = require_enabled_site()
+        if blocked is not None:
+            return blocked
         state = load_panel_state(app.config["PANEL_STATE_PATH"])
         payload = build_overview_payload(app.config["PROJECT_ROOT"])
         payload["site_enabled"] = bool(state.get("site_enabled", True))
@@ -452,6 +547,9 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
     @app.get("/api/file/<job_id>")
     @login_required
     def api_file(job_id: str):
+        blocked = require_enabled_site()
+        if blocked is not None:
+            return blocked
         safe_job_id = str(job_id or "").strip().lower()
         if not safe_job_id:
             abort(404)

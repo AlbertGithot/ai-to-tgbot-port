@@ -46,7 +46,7 @@ SITE_DASHBOARD_RUNTIME_DIR_NAME = "web_panel_runtime"
 SITE_DASHBOARD_STATE_FILE_NAME = "panel_state.json"
 SITE_DASHBOARD_PROCESS_FILE_NAME = "site_dashboard_process.json"
 SITE_DASHBOARD_LOG_FILE_NAME = "site_dashboard.log"
-SITE_DASHBOARD_DEFAULT_HOST = "0.0.0.0"
+SITE_DASHBOARD_DEFAULT_HOST = "127.0.0.1"
 SITE_DASHBOARD_DEFAULT_PORT = 5080
 SITE_DASHBOARD_DEFAULT_REFRESH_SECONDS = 4
 MODEL_SCAN_COMMON_ROOT_LIMIT = 200
@@ -892,7 +892,8 @@ def show_site_dashboard_status(project_root: Path) -> None:
         print("", flush=True)
     if status["host"] in {"127.0.0.1", "::1", "localhost"}:
         print(
-            "Сейчас панель привязана только к loopback. Чтобы зайти по IP сервера, выставь SITE_DASHBOARD_HOST=0.0.0.0.\n",
+            "Сейчас панель привязана только к loopback. Это безопасный режим по умолчанию.\n"
+            "Если нужен внешний доступ, выставь SITE_DASHBOARD_HOST=0.0.0.0 и не забудь про firewall.\n",
             flush=True,
         )
     if status["running"] and status["recovered"]:

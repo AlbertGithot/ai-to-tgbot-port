@@ -77,9 +77,21 @@ class SiteDashboardTests(unittest.TestCase):
 
     def test_ensure_panel_state_generates_access_code_and_secret(self) -> None:
         self.assertTrue(self.generated_code)
+        self.assertGreaterEqual(len(self.generated_code), 16)
         self.assertTrue(self.state["session_secret"])
         self.assertTrue(self.state["access_code_hash"])
         self.assertTrue(self.state["site_enabled"])
+
+    def test_failed_login_tracker_blocks_after_limit(self) -> None:
+        failures: dict[str, dict[str, float]] = {}
+        now = 1000.0
+        for _ in range(site_dashboard.LOGIN_FAILURE_LIMIT):
+            site_dashboard.register_failed_login(failures, "127.0.0.1", now=now)
+
+        self.assertGreater(
+            site_dashboard.get_login_block_remaining_seconds(failures, "127.0.0.1", now=now),
+            0,
+        )
 
     def test_build_overview_payload_collects_jobs_tasks_and_files(self) -> None:
         self._write_long_think_result()
@@ -109,6 +121,21 @@ class SiteDashboardTests(unittest.TestCase):
         payload = authorized.get_json()
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["stats"]["result_file_count"], 1)
+
+    def test_dashboard_api_returns_403_when_site_disabled(self) -> None:
+        with self.client.session_transaction() as session:
+            session["panel_authenticated"] = True
+
+        state = site_dashboard.load_panel_state(self.state_path)
+        state["site_enabled"] = False
+        site_dashboard.save_panel_state(self.state_path, state)
+
+        response = self.client.get("/api/overview")
+
+        self.assertEqual(response.status_code, 403)
+        payload = response.get_json()
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "site_disabled")
 
     def test_manage_toggle_changes_site_state(self) -> None:
         with self.client.session_transaction() as session:

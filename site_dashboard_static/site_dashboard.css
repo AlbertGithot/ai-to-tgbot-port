@@ -40,7 +40,8 @@ a {
 }
 
 button,
-input {
+input,
+textarea {
   font: inherit;
 }
 
@@ -293,17 +294,29 @@ h2 {
   gap: 12px;
 }
 
+.form-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 label {
   font-weight: 700;
 }
 
-input {
+input,
+textarea {
   width: 100%;
   min-height: 48px;
-  padding: 0 14px;
+  padding: 12px 14px;
   border: 1px solid rgba(31, 36, 48, 0.14);
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.84);
+}
+
+textarea {
+  resize: vertical;
+  min-height: 160px;
 }
 
 .status-box,
@@ -326,6 +339,13 @@ input {
 .dashboard-layout {
   display: grid;
   gap: 20px;
+}
+
+.resource-grid,
+.wide-grid {
+  display: grid;
+  gap: 20px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .dashboard-hero {
@@ -362,6 +382,10 @@ input {
   gap: 12px;
   align-items: center;
   justify-content: space-between;
+}
+
+.panel-heading {
+  margin-bottom: 16px;
 }
 
 .list-grid {
@@ -410,6 +434,99 @@ code {
   font-weight: 700;
 }
 
+.resource-pill-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.resource-pill {
+  display: grid;
+  gap: 8px;
+  padding: 18px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.52);
+  box-shadow: inset 0 0 0 1px rgba(31, 36, 48, 0.08);
+}
+
+.resource-pill span {
+  color: var(--muted);
+}
+
+.resource-pill strong {
+  font-size: 1.9rem;
+  letter-spacing: -0.04em;
+}
+
+.chart-stack {
+  display: grid;
+  gap: 14px;
+}
+
+.chart-card {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.52);
+  box-shadow: inset 0 0 0 1px rgba(31, 36, 48, 0.08);
+}
+
+.line-chart {
+  width: 100%;
+  height: 140px;
+  border-radius: 16px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.4), rgba(31, 36, 48, 0.02));
+}
+
+.chart-grid-line {
+  fill: none;
+  stroke: rgba(31, 36, 48, 0.12);
+  stroke-width: 0.7;
+  vector-effect: non-scaling-stroke;
+}
+
+.chart-line {
+  fill: none;
+  stroke: var(--chart-color, var(--brand));
+  stroke-width: 2.4;
+  vector-effect: non-scaling-stroke;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.log-stack {
+  display: grid;
+  gap: 14px;
+}
+
+.log-card {
+  display: grid;
+  gap: 12px;
+  padding: 18px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.52);
+  box-shadow: inset 0 0 0 1px rgba(31, 36, 48, 0.08);
+}
+
+.log-tail {
+  margin: 0;
+  max-height: 280px;
+  overflow: auto;
+  padding: 16px;
+  border-radius: 16px;
+  background: #18212c;
+  color: #dfe9f2;
+  font-family: "SFMono-Regular", "Consolas", "Liberation Mono", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.artifact-actions {
+  justify-content: flex-start;
+}
+
 .empty-state {
   padding: 18px;
   border-radius: 18px;
@@ -435,7 +552,11 @@ code {
   .landing-grid,
   .manage-layout,
   .panel-grid,
-  .stats-grid {
+  .stats-grid,
+  .resource-grid,
+  .wide-grid,
+  .resource-pill-grid,
+  .form-grid {
     grid-template-columns: 1fr;
   }
 

@@ -7,9 +7,9 @@
   <section class="dashboard-hero">
     <div>
       <p class="eyebrow">Realtime control</p>
-      <h1>Текущие процессы, задачи и JSON-файлы от нейросети.</h1>
+      <h1>Панель процессов, логов, артефактов и живых метрик сервера.</h1>
       <p class="muted">
-        Всё ниже обновляется автоматически. Если модель опять творит дичь, это хотя бы видно сразу, а не через полдня страданий.
+        Здесь уже не просто “посмотреть JSON”. Видно, чем дышит сервер, что пишет модель, какие логи горят и что она наскребла по артефактам.
       </p>
     </div>
     <div class="stacked-actions">
@@ -37,6 +37,29 @@
     </article>
   </section>
 
+  <section class="resource-grid">
+    <article class="panel-card">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Ресурсы</p>
+          <h2>Текущее состояние сервера</h2>
+        </div>
+        <span class="muted" id="generated-at">{{ overview.generated_at }}</span>
+      </div>
+      <div class="resource-pill-grid" id="resource-current"></div>
+    </article>
+
+    <article class="panel-card">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Графики</p>
+          <h2>CPU / RAM / GPU история</h2>
+        </div>
+      </div>
+      <div id="resource-charts" class="chart-stack"></div>
+    </article>
+  </section>
+
   <section class="panel-grid">
     <article class="panel-card">
       <div class="panel-heading">
@@ -44,7 +67,6 @@
           <p class="eyebrow">Процессы</p>
           <h2>Текущие процессы</h2>
         </div>
-        <span class="muted" id="generated-at">{{ overview.generated_at }}</span>
       </div>
       <div id="process-list" class="list-grid"></div>
     </article>
@@ -57,6 +79,29 @@
         </div>
       </div>
       <div id="job-list" class="list-grid"></div>
+    </article>
+  </section>
+
+  <section class="panel-grid">
+    <article class="panel-card">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Логи</p>
+          <h2>Live-логи сервиса</h2>
+        </div>
+        <span class="muted">Подтягиваются автоматически</span>
+      </div>
+      <div id="log-list" class="log-stack"></div>
+    </article>
+
+    <article class="panel-card">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Артефакты</p>
+          <h2>Файловый браузер результатов</h2>
+        </div>
+      </div>
+      <div id="artifact-list" class="list-grid"></div>
     </article>
   </section>
 
@@ -82,17 +127,32 @@
     </article>
   </section>
 
-  <section class="panel-card json-viewer-card">
-    <div class="panel-heading">
-      <div>
-        <p class="eyebrow">JSON viewer</p>
-        <h2>Содержимое result.json</h2>
+  <section class="panel-grid wide-grid">
+    <article class="panel-card json-viewer-card">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">JSON viewer</p>
+          <h2>Содержимое result.json</h2>
+        </div>
+        <span class="muted">Нажми “Открыть JSON” у нужного файла</span>
       </div>
-      <span class="muted">Нажми “Открыть JSON” у нужного файла</span>
-    </div>
-    <pre id="json-viewer" class="json-viewer">{
-  "hint": "Выбери готовый JSON-файл из списка слева."
+      <pre id="json-viewer" class="json-viewer">{
+  "hint": "Выбери готовый JSON-файл из списка."
 }</pre>
+    </article>
+
+    <article class="panel-card json-viewer-card">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Artifact viewer</p>
+          <h2>Просмотр артефакта</h2>
+        </div>
+        <span class="muted">Открой любой .json/.md/.txt/.log</span>
+      </div>
+      <pre id="artifact-viewer" class="json-viewer">{
+  "hint": "Выбери артефакт из списка выше."
+}</pre>
+    </article>
   </section>
 </main>
 
@@ -112,6 +172,13 @@
   function badge(status) {
     const normalized = String(status || 'unknown').toLowerCase();
     return `<span class="mini-badge badge-${escapeHtml(normalized)}">${escapeHtml(status || 'unknown')}</span>`;
+  }
+
+  function percentText(value) {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) {
+      return 'N/A';
+    }
+    return `${Number(value).toFixed(1)}%`;
   }
 
   function renderProcesses(processes) {
@@ -144,7 +211,7 @@
     container.innerHTML = jobs.map((job) => `
       <article class="list-card">
         <div class="list-row">
-          <strong>${escapeHtml(job.job_id.slice(0, 8))}</strong>
+          <strong>${escapeHtml(String(job.job_id || '').slice(0, 8))}</strong>
           ${badge(job.status)}
         </div>
         <p>${escapeHtml(job.request_text || 'Без текста запроса')}</p>
@@ -159,9 +226,20 @@
           <span>Итерации: ${escapeHtml(job.completed_iterations)}/${escapeHtml(job.planned_iterations)}</span>
           <span>Осталось: ${escapeHtml(job.remaining)}</span>
         </div>
+        ${job.note ? `<div class="muted">${escapeHtml(job.note)}</div>` : ''}
         ${job.error ? `<div class="danger-line">${escapeHtml(job.error)}</div>` : ''}
       </article>
     `).join('');
+  }
+
+  async function openJson(jobId) {
+    const response = await fetch(`/api/file/${encodeURIComponent(jobId)}`);
+    if (!response.ok) {
+      document.getElementById('json-viewer').textContent = JSON.stringify({ error: 'Не удалось открыть JSON' }, null, 2);
+      return;
+    }
+    const payload = await response.json();
+    document.getElementById('json-viewer').textContent = JSON.stringify(payload.payload, null, 2);
   }
 
   function renderFiles(files) {
@@ -173,7 +251,7 @@
     container.innerHTML = files.map((file) => `
       <article class="list-card">
         <div class="list-row">
-          <strong>${escapeHtml(file.job_id.slice(0, 8))}</strong>
+          <strong>${escapeHtml(String(file.job_id || '').slice(0, 8))}</strong>
           ${badge(file.status)}
         </div>
         <p>${escapeHtml(file.request_text || 'Без текста запроса')}</p>
@@ -188,14 +266,7 @@
     `).join('');
     for (const button of container.querySelectorAll('.open-json')) {
       button.addEventListener('click', async () => {
-        const jobId = button.dataset.jobId;
-        const response = await fetch(`/api/file/${encodeURIComponent(jobId)}`);
-        if (!response.ok) {
-          document.getElementById('json-viewer').textContent = JSON.stringify({ error: 'Не удалось открыть JSON' }, null, 2);
-          return;
-        }
-        const payload = await response.json();
-        document.getElementById('json-viewer').textContent = JSON.stringify(payload.payload, null, 2);
+        await openJson(button.dataset.jobId);
       });
     }
   }
@@ -209,7 +280,7 @@
     container.innerHTML = tasks.map((task) => `
       <article class="list-card">
         <div class="list-row">
-          <strong>${escapeHtml(task.task_id.slice(0, 8))}</strong>
+          <strong>${escapeHtml(String(task.task_id || '').slice(0, 8))}</strong>
           ${badge(task.status)}
         </div>
         <p>${escapeHtml(task.description || task.kind)}</p>
@@ -223,14 +294,141 @@
     `).join('');
   }
 
+  function renderLogs(logs) {
+    const container = document.getElementById('log-list');
+    if (!logs.length) {
+      container.innerHTML = '<div class="empty-state">Логи пока пустые. Либо всё идеально, либо оно ещё не успело сломаться.</div>';
+      return;
+    }
+    container.innerHTML = logs.map((log) => `
+      <article class="log-card">
+        <div class="list-row">
+          <strong>${escapeHtml(log.name)}</strong>
+          <span class="muted">${log.exists ? 'лог найден' : 'лог отсутствует'}</span>
+        </div>
+        <code>${escapeHtml(log.path)}</code>
+        <pre class="log-tail">${escapeHtml(log.tail || 'Лог пуст.')}</pre>
+      </article>
+    `).join('');
+  }
+
+  async function openArtifact(path) {
+    const response = await fetch(`/api/artifact?path=${encodeURIComponent(path)}`);
+    if (!response.ok) {
+      document.getElementById('artifact-viewer').textContent = JSON.stringify({ error: 'Не удалось открыть артефакт' }, null, 2);
+      return;
+    }
+    const payload = await response.json();
+    document.getElementById('artifact-viewer').textContent = payload.preview_text || '';
+  }
+
+  function humanizeBytes(bytes) {
+    let value = Number(bytes || 0);
+    const units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
+    let index = 0;
+    while (value >= 1024 && index < units.length - 1) {
+      value /= 1024;
+      index += 1;
+    }
+    return index === 0 ? `${Math.round(value)} ${units[index]}` : `${value.toFixed(1)} ${units[index]}`;
+  }
+
+  function renderArtifacts(artifacts) {
+    const container = document.getElementById('artifact-list');
+    if (!artifacts.length) {
+      container.innerHTML = '<div class="empty-state">Артефактов пока нет. Нейросеть ещё не успела накопить свои улики.</div>';
+      return;
+    }
+    container.innerHTML = artifacts.map((artifact) => `
+      <article class="list-card">
+        <div class="list-row">
+          <strong>${escapeHtml(artifact.name)}</strong>
+          <span class="muted">${escapeHtml(artifact.updated_at || '-')}</span>
+        </div>
+        <div class="list-row">
+          <span>${escapeHtml(artifact.directory || '.')}</span>
+          <span>${escapeHtml(humanizeBytes(artifact.size_bytes))}</span>
+        </div>
+        <code>${escapeHtml(artifact.relative_path)}</code>
+        <div class="stacked-actions artifact-actions">
+          ${artifact.is_previewable ? `<button class="ghost-button open-artifact" type="button" data-path="${escapeHtml(artifact.relative_path)}">Открыть</button>` : ''}
+          <a class="secondary-button" href="/api/artifact-download?path=${encodeURIComponent(artifact.relative_path)}">Скачать</a>
+        </div>
+      </article>
+    `).join('');
+    for (const button of container.querySelectorAll('.open-artifact')) {
+      button.addEventListener('click', async () => {
+        await openArtifact(button.dataset.path);
+      });
+    }
+  }
+
+  function buildLineChart(points, color, label) {
+    if (!points.length) {
+      return `
+        <article class="chart-card">
+          <div class="list-row"><strong>${escapeHtml(label)}</strong><span class="muted">N/A</span></div>
+          <div class="empty-state">Пока нет данных.</div>
+        </article>
+      `;
+    }
+    const maxIndex = Math.max(1, points.length - 1);
+    const path = points.map((point, index) => {
+      const x = (index / maxIndex) * 100;
+      const y = 100 - Math.max(0, Math.min(100, Number(point || 0)));
+      return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
+    }).join(' ');
+    const latest = points[points.length - 1];
+    return `
+      <article class="chart-card">
+        <div class="list-row"><strong>${escapeHtml(label)}</strong><span class="muted">${escapeHtml(percentText(latest))}</span></div>
+        <svg viewBox="0 0 100 100" preserveAspectRatio="none" class="line-chart">
+          <path class="chart-grid-line" d="M 0 25 L 100 25"></path>
+          <path class="chart-grid-line" d="M 0 50 L 100 50"></path>
+          <path class="chart-grid-line" d="M 0 75 L 100 75"></path>
+          <path class="chart-line" d="${path}" style="--chart-color:${color}"></path>
+        </svg>
+      </article>
+    `;
+  }
+
+  function renderResources(overview) {
+    const current = overview.system_resources || {};
+    const history = Array.isArray(overview.resource_history) ? overview.resource_history : [];
+    const currentContainer = document.getElementById('resource-current');
+    currentContainer.innerHTML = `
+      <div class="resource-pill">
+        <span>CPU</span>
+        <strong>${escapeHtml(percentText(current.cpu_percent))}</strong>
+      </div>
+      <div class="resource-pill">
+        <span>RAM</span>
+        <strong>${escapeHtml(percentText(current.ram_percent))}</strong>
+      </div>
+      <div class="resource-pill">
+        <span>GPU</span>
+        <strong>${escapeHtml(percentText(current.gpu_percent))}</strong>
+      </div>
+    `;
+    const chartsContainer = document.getElementById('resource-charts');
+    chartsContainer.innerHTML = [
+      buildLineChart(history.map((item) => item.cpu_percent), '#275d52', 'CPU'),
+      buildLineChart(history.map((item) => item.ram_percent), '#d97c37', 'RAM'),
+      buildLineChart(history.map((item) => item.gpu_percent), '#6a4dd8', 'GPU'),
+    ].join('');
+  }
+
   function renderOverview(overview) {
     document.getElementById('stat-active-jobs').textContent = overview.stats.active_job_count;
     document.getElementById('stat-result-files').textContent = overview.stats.result_file_count;
     document.getElementById('stat-running-tasks').textContent = overview.stats.running_task_count;
     document.getElementById('stat-processes').textContent = overview.stats.process_count;
     document.getElementById('generated-at').textContent = overview.generated_at;
+    renderResources(overview);
     renderProcesses(overview.processes || []);
     renderJobs(overview.long_think_jobs || []);
+    renderLogs(overview.logs || []);
+    renderArtifacts(overview.artifacts || []);
     renderFiles(overview.result_files || []);
     renderTasks(overview.background_tasks || []);
   }

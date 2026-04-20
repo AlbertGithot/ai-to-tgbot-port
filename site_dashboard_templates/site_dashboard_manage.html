@@ -44,5 +44,53 @@
       <a class="ghost-link" href="{{ url_for('index') }}">На главную</a>
     </div>
   </section>
+
+  <section class="panel-card">
+    <p class="eyebrow">Security</p>
+    <h2>Whitelist и rate-limit</h2>
+    <form class="stack-form" method="post">
+      <input type="hidden" name="action" value="update-security">
+      <label for="ip_whitelist_text">IP whitelist</label>
+      <textarea
+        id="ip_whitelist_text"
+        name="ip_whitelist_text"
+        rows="8"
+        placeholder="Оставь пустым, если доступ нужен отовсюду&#10;Или впиши IP/сети по одной на строку:&#10;45.93.200.129&#10;203.0.113.0/24"
+      >{{ ip_whitelist_text }}</textarea>
+
+      <div class="form-grid">
+        <div>
+          <label for="login_rate_limit_window_seconds">Окно rate-limit, сек.</label>
+          <input
+            id="login_rate_limit_window_seconds"
+            name="login_rate_limit_window_seconds"
+            type="number"
+            min="30"
+            step="1"
+            value="{{ login_rate_limit_window_seconds }}"
+            required
+          >
+        </div>
+        <div>
+          <label for="login_rate_limit_max_attempts">Макс. попыток входа</label>
+          <input
+            id="login_rate_limit_max_attempts"
+            name="login_rate_limit_max_attempts"
+            type="number"
+            min="2"
+            step="1"
+            value="{{ login_rate_limit_max_attempts }}"
+            required
+          >
+        </div>
+      </div>
+
+      <button class="primary-button" type="submit">Сохранить security-настройки</button>
+    </form>
+    <p class="muted">
+      Пустой whitelist пускает всех. Если впишешь IP или подсети, панель начнёт фильтровать доступ без лишней драмы.
+      Rate-limit режет перебор кода доступа, чтобы какой-нибудь особо бодрый товарищ не решил устроить brute-force-дискотеку.
+    </p>
+  </section>
 </main>
 {% endblock %}

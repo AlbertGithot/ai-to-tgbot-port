@@ -20,6 +20,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,11 @@ SITE_DASHBOARD_LOG_FILE_NAME = "site_dashboard.log"
 SITE_DASHBOARD_DEFAULT_HOST = "127.0.0.1"
 SITE_DASHBOARD_DEFAULT_PORT = 5080
 SITE_DASHBOARD_DEFAULT_REFRESH_SECONDS = 4
+SITE_DASHBOARD_REVERSE_PROXY_DIR_NAME = "reverse_proxy"
+SITE_DASHBOARD_CADDY_FILE_NAME = "heymate-site-dashboard.Caddyfile"
+SITE_DASHBOARD_NGINX_FILE_NAME = "heymate-site-dashboard.nginx.conf"
+BACKUPS_DIR_NAME = "backups"
+UPDATE_HISTORY_LIMIT = 12
 MODEL_SCAN_COMMON_ROOT_LIMIT = 200
 MODEL_SCAN_SYSTEM_ROOT_LIMIT = 800
 MODEL_SCAN_SKIP_DIR_NAMES = {
@@ -581,6 +587,8 @@ def list_terminal_sessions(project_root: Path) -> list[dict[str, Any]]:
             continue
         payload = load_json(path)
         history = payload.get("history", [])
+        settings = payload.get("settings") if isinstance(payload.get("settings"), dict) else {}
+        tags = payload.get("tags") if isinstance(payload.get("tags"), list) else []
         sessions.append(
             {
                 "session_number": session_number,
@@ -593,6 +601,10 @@ def list_terminal_sessions(project_root: Path) -> list[dict[str, Any]]:
                 ),
                 "request_count": coerce_nonnegative_int(payload.get("request_count")),
                 "history_items": len(history) if isinstance(history, list) else 0,
+                "tags": [str(item).strip() for item in tags if str(item).strip()],
+                "response_mode": str(settings.get("response_mode") or "chat"),
+                "active_project_id": str(settings.get("active_project_id") or ""),
+                "attached_model_name": str(payload.get("attached_model_name") or ""),
             }
         )
     sessions.sort(key=lambda item: int(item["session_number"]))
@@ -607,15 +619,38 @@ def print_terminal_sessions_overview(project_root: Path) -> list[dict[str, Any]]
 
     print("Сохранённые terminal-сессии:", flush=True)
     for session in sessions:
+        tags = f" | теги: {', '.join(session['tags'][:3])}" if session.get("tags") else ""
+        model_name = f" | модель: {session['attached_model_name']}" if session.get("attached_model_name") else ""
         print(
             f"#{session['session_number']} | {session['title']} | "
             f"запросов: {session['request_count']} | "
             f"сообщений в памяти: {session['history_items']} | "
-            f"обновлена: {session['updated_at']}",
+            f"режим: {session.get('response_mode') or 'chat'} | "
+            f"обновлена: {session['updated_at']}{tags}{model_name}",
             flush=True,
         )
     print("", flush=True)
     return sessions
+
+
+def search_terminal_sessions(project_root: Path, query: str) -> list[dict[str, Any]]:
+    needle = str(query or "").strip().casefold()
+    if not needle:
+        return list_terminal_sessions(project_root)
+    matches: list[dict[str, Any]] = []
+    for session in list_terminal_sessions(project_root):
+        haystack = " ".join(
+            [
+                str(session.get("title") or ""),
+                str(session.get("attached_model_name") or ""),
+                str(session.get("response_mode") or ""),
+                " ".join(str(tag) for tag in session.get("tags") or []),
+                str(session.get("active_project_id") or ""),
+            ]
+        ).casefold()
+        if needle in haystack:
+            matches.append(session)
+    return matches
 
 
 def read_text_tail(path: Path, max_chars: int = LOG_PREVIEW_CHARS) -> str:
@@ -761,6 +796,169 @@ def load_site_dashboard_settings(project_root: Path) -> dict[str, Any]:
         "access_urls": access_urls,
         "url": access_urls[0],
     }
+
+
+def site_dashboard_reverse_proxy_root(project_root: Path) -> Path:
+    return site_dashboard_runtime_root(project_root) / SITE_DASHBOARD_REVERSE_PROXY_DIR_NAME
+
+
+def is_probably_domain_name(raw_value: str) -> bool:
+    text = str(raw_value or "").strip().strip(".")
+    if not text or " " in text:
+        return False
+    try:
+        ipaddress.ip_address(text.strip("[]"))
+    except ValueError:
+        return "." in text and all(part and re.match(r"^[A-Za-z0-9-]+$", part) for part in text.split("."))
+    return False
+
+
+def build_site_dashboard_caddyfile(project_root: Path, server_name: str) -> str:
+    settings = load_site_dashboard_settings(project_root)
+    upstream = f"127.0.0.1:{settings['port']}"
+    normalized_name = str(server_name or "").strip()
+    if not normalized_name:
+        normalized_name = settings.get("public_host_override") or settings["access_hosts"][0]
+    site_label = normalized_name
+    if not is_probably_domain_name(normalized_name):
+        site_label = f"http://{normalized_name}"
+    return textwrap.dedent(
+        f"""
+        {site_label} {{
+            reverse_proxy {upstream}
+
+            header {{
+                X-Forwarded-Proto {{scheme}}
+                X-Forwarded-Host {{host}}
+                X-Real-IP {{remote_host}}
+            }}
+
+            encode zstd gzip
+        }}
+        """
+    ).strip() + "\n"
+
+
+def build_site_dashboard_nginx_config(project_root: Path, server_name: str) -> str:
+    settings = load_site_dashboard_settings(project_root)
+    normalized_name = str(server_name or "").strip() or "_"
+    return textwrap.dedent(
+        f"""
+        server {{
+            listen 80;
+            server_name {normalized_name};
+
+            client_max_body_size 32m;
+
+            location / {{
+                proxy_pass http://127.0.0.1:{settings['port']};
+                proxy_http_version 1.1;
+                proxy_set_header Host $host;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_read_timeout 3600s;
+                proxy_send_timeout 3600s;
+            }}
+        }}
+        """
+    ).strip() + "\n"
+
+
+def write_site_dashboard_reverse_proxy_configs(project_root: Path, server_name: str) -> tuple[Path, Path]:
+    root = site_dashboard_reverse_proxy_root(project_root)
+    root.mkdir(parents=True, exist_ok=True)
+    caddy_path = root / SITE_DASHBOARD_CADDY_FILE_NAME
+    nginx_path = root / SITE_DASHBOARD_NGINX_FILE_NAME
+    caddy_path.write_text(build_site_dashboard_caddyfile(project_root, server_name), encoding="utf-8")
+    nginx_path.write_text(build_site_dashboard_nginx_config(project_root, server_name), encoding="utf-8")
+    return caddy_path, nginx_path
+
+
+def check_local_tcp_port(host: str, port: int, timeout: float = 0.7) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def collect_port_listener_details(port: int) -> list[str]:
+    commands = [
+        ["ss", "-ltnp"],
+        ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+    ]
+    results: list[str] = []
+    seen: set[str] = set()
+    for command in commands:
+        if not shutil.which(command[0]):
+            continue
+        completed = run_capture_command(command, timeout=8)
+        if completed is None or completed.returncode != 0:
+            continue
+        for raw_line in (completed.stdout or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if command[0] == "ss" and f":{port}" not in line:
+                continue
+            if line in seen:
+                continue
+            seen.add(line)
+            results.append(line)
+    return results[:20]
+
+
+def collect_firewall_status_lines(port: int) -> list[str]:
+    lines: list[str] = []
+    if shutil.which("ufw"):
+        completed = run_capture_command(["ufw", "status"], timeout=10)
+        if completed is not None and completed.returncode == 0:
+            output = (completed.stdout or "").strip()
+            if output:
+                lowered = output.lower()
+                if "inactive" in lowered:
+                    lines.append("ufw: inactive")
+                else:
+                    matching = [line.strip() for line in output.splitlines() if str(port) in line]
+                    if matching:
+                        lines.extend(f"ufw: {line}" for line in matching[:4])
+                    else:
+                        lines.append(f"ufw: rules for {port}/tcp не нашёл")
+    if shutil.which("firewall-cmd"):
+        state_completed = run_capture_command(["firewall-cmd", "--state"], timeout=8)
+        if state_completed is not None and state_completed.returncode == 0:
+            state = (state_completed.stdout or "").strip()
+            if state == "running":
+                ports_completed = run_capture_command(["firewall-cmd", "--list-ports"], timeout=8)
+                ports_text = (ports_completed.stdout or "").strip() if ports_completed is not None else ""
+                if f"{port}/tcp" in ports_text.split():
+                    lines.append(f"firewalld: {port}/tcp открыт")
+                else:
+                    lines.append(f"firewalld: {port}/tcp не найден в открытых портах")
+            else:
+                lines.append(f"firewalld: state={state or 'unknown'}")
+    return lines
+
+
+def save_site_dashboard_network_settings(
+    project_root: Path,
+    *,
+    host: str,
+    public_host: str,
+    port: int,
+    refresh_seconds: int,
+) -> None:
+    order, values = load_env_template(project_root)
+    values["SITE_DASHBOARD_HOST"] = str(host).strip() or SITE_DASHBOARD_DEFAULT_HOST
+    values["SITE_DASHBOARD_PORT"] = str(coerce_site_dashboard_port(port))
+    values["SITE_DASHBOARD_REFRESH_SECONDS"] = str(coerce_site_dashboard_refresh_seconds(refresh_seconds))
+    normalized_public_host = str(public_host or "").strip()
+    if normalized_public_host:
+        values["SITE_DASHBOARD_PUBLIC_HOST"] = normalized_public_host
+    else:
+        values.pop("SITE_DASHBOARD_PUBLIC_HOST", None)
+    write_env_file(project_root, values, order)
 
 
 def build_site_dashboard_launch_env(project_root: Path) -> dict[str, str]:
@@ -1076,6 +1274,136 @@ def show_site_dashboard_log(project_root: Path) -> None:
     print("=== site_dashboard.log ===", flush=True)
     print(read_text_tail(log_path), flush=True)
     pause()
+
+
+def configure_site_dashboard_network_settings_from_launcher(project_root: Path) -> None:
+    cls()
+    settings = load_site_dashboard_settings(project_root)
+    current_host = settings["host"]
+    current_public_host = settings.get("public_host_override") or ""
+    current_port = settings["port"]
+    current_refresh = settings["refresh_seconds"]
+    print(
+        "Сетевые настройки веб-панели.\n"
+        "Если панель висит за reverse proxy, обычно лучше слушать 127.0.0.1, а наружу отдавать домен через Caddy/Nginx.\n",
+        flush=True,
+    )
+    host = prompt_text("HOST", default=current_host)
+    public_host = prompt_text("PUBLIC_HOST (домен/IP для ссылок, можно пусто)", default=current_public_host, allow_empty=True)
+    try:
+        port = coerce_site_dashboard_port(prompt_text("PORT", default=str(current_port)))
+        refresh = coerce_site_dashboard_refresh_seconds(prompt_text("REFRESH_SECONDS", default=str(current_refresh)))
+    except Exception:
+        print("С числами не срослось. Нормально впиши порт и refresh.\n", flush=True)
+        pause()
+        return
+    save_site_dashboard_network_settings(
+        project_root,
+        host=host,
+        public_host=public_host,
+        port=port,
+        refresh_seconds=refresh,
+    )
+    print(
+        "Сетевые настройки панели сохранил.\n"
+        f"- Слушать: {host}:{port}\n"
+        f"- Публичный адрес: {public_host or '(автоопределение)'}\n"
+        f"- Обновление UI: {refresh} сек.\n",
+        flush=True,
+    )
+    pause()
+
+
+def show_site_dashboard_network_diagnostics(project_root: Path) -> None:
+    cls()
+    settings = load_site_dashboard_settings(project_root)
+    status = get_site_dashboard_status(project_root)
+    state = load_json(site_dashboard_state_path(project_root))
+    whitelist = str(state.get("ip_whitelist_text") or "").strip()
+    local_probe_hosts = ["127.0.0.1"]
+    if settings["host"] not in {"0.0.0.0", "::", "127.0.0.1", "::1", "localhost"}:
+        local_probe_hosts.insert(0, settings["host"])
+    print(
+        "Диагностика веб-панели.\n"
+        f"- Слушает: {settings['listen_url']}\n"
+        f"- Публичные ссылки: {', '.join(settings['access_urls'])}\n"
+        f"- Процесс панели: {'жив' if status['running'] else 'не найден'}\n"
+        f"- PID: {status.get('pid') or '-'}\n"
+        f"- PUBLIC_HOST: {settings.get('public_host_override') or '(не задан)'}\n"
+        f"- Whitelist: {whitelist or 'пустой, доступ не ограничен по IP'}\n",
+        flush=True,
+    )
+    for host in local_probe_hosts:
+        probe_ok = check_local_tcp_port(host, settings["port"])
+        print(f"- TCP probe {host}:{settings['port']}: {'открыт' if probe_ok else 'не отвечает'}", flush=True)
+    listener_lines = collect_port_listener_details(settings["port"])
+    if listener_lines:
+        print("\nЧто слушает порт:", flush=True)
+        for line in listener_lines:
+            print(f"- {line}", flush=True)
+    else:
+        print("\nПо `ss/lsof` слушателя на этом порту не увидел.\n", flush=True)
+    firewall_lines = collect_firewall_status_lines(settings["port"])
+    if firewall_lines:
+        print("Firewall/доступ:", flush=True)
+        for line in firewall_lines:
+            print(f"- {line}", flush=True)
+        print("", flush=True)
+    proxy_root = site_dashboard_reverse_proxy_root(project_root)
+    if proxy_root.is_dir():
+        print("Сгенерированные proxy-конфиги:", flush=True)
+        for path in sorted(proxy_root.glob("*")):
+            print(f"- {path}", flush=True)
+        print("", flush=True)
+    pause()
+
+
+def generate_site_dashboard_reverse_proxy_files(project_root: Path) -> None:
+    cls()
+    settings = load_site_dashboard_settings(project_root)
+    default_name = settings.get("public_host_override") or settings["access_hosts"][0]
+    server_name = prompt_text("Домен или IP для reverse proxy", default=default_name)
+    caddy_path, nginx_path = write_site_dashboard_reverse_proxy_configs(project_root, server_name)
+    print(
+        "Сгенерировал reverse proxy-конфиги.\n"
+        f"- Caddy: {caddy_path}\n"
+        f"- Nginx: {nginx_path}\n\n"
+        "Подсказка:\n"
+        "- Для HTTPS без цирка лучше домен и Caddy.\n"
+        "- Если используешь reverse proxy, часто разумно держать SITE_DASHBOARD_HOST=127.0.0.1.\n",
+        flush=True,
+    )
+    pause()
+
+
+def site_dashboard_network_menu(project_root: Path) -> None:
+    while True:
+        cls()
+        settings = load_site_dashboard_settings(project_root)
+        print_block(
+            f"""
+            Сетевой слой веб-панели.
+            Сейчас панель слушает {settings['listen_url']}, а наружу светится как {settings['url']}.
+            Тут можно подкрутить host/port, проверить порт и сгенерировать reverse proxy-конфиги.
+            """
+        )
+        choice = prompt_choice(
+            "Сеть и HTTPS",
+            [
+                "Показать диагностику порта и firewall",
+                "Изменить host/port/public host",
+                "Сгенерировать Caddy/Nginx конфиги",
+                "Назад",
+            ],
+        )
+        if choice == 1:
+            show_site_dashboard_network_diagnostics(project_root)
+        elif choice == 2:
+            configure_site_dashboard_network_settings_from_launcher(project_root)
+        elif choice == 3:
+            generate_site_dashboard_reverse_proxy_files(project_root)
+        else:
+            return
 
 
 def install_site_dashboard_systemd_service(project_root: Path) -> None:
@@ -2006,6 +2334,7 @@ def handle_project_update_status(
         )
         return
 
+    record_installed_project_update(project_root, update_status)
     print("Обновление поставил. Перезапускаю лаунчер...\n", flush=True)
     time.sleep(1)
     restart_launcher(project_root)
@@ -2036,6 +2365,168 @@ def maybe_offer_project_update(project_root: Path) -> None:
         show_unavailable=False,
         show_intro_banner=False,
     )
+
+
+def append_update_history_record(project_root: Path, record: dict[str, Any]) -> None:
+    state_path = project_root / STATE_FILE_NAME
+    state = load_json(state_path)
+    history = state.get("update_history")
+    if not isinstance(history, list):
+        history = []
+    history.append(record)
+    state["update_history"] = history[-UPDATE_HISTORY_LIMIT:]
+    save_json(state_path, state)
+
+
+def list_update_history_records(project_root: Path) -> list[dict[str, Any]]:
+    state = load_json(project_root / STATE_FILE_NAME)
+    history = state.get("update_history")
+    if not isinstance(history, list):
+        return []
+    return [item for item in history if isinstance(item, dict)]
+
+
+def record_installed_project_update(project_root: Path, update_status: dict[str, Any]) -> None:
+    append_update_history_record(
+        project_root,
+        {
+            "type": "update",
+            "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "branch": str(update_status.get("branch") or current_git_branch(project_root)),
+            "from_sha": str(update_status.get("local_sha") or ""),
+            "to_sha": str(update_status.get("remote_sha") or current_git_head_sha(project_root)),
+            "from_version": str(update_status.get("local_version") or ""),
+            "to_version": str(update_status.get("remote_version") or current_git_head_sha(project_root)[:7]),
+        },
+    )
+
+
+def backups_root(project_root: Path) -> Path:
+    return project_root / BACKUPS_DIR_NAME
+
+
+def list_project_backups(project_root: Path) -> list[Path]:
+    root = backups_root(project_root)
+    if not root.is_dir():
+        return []
+    return sorted((path for path in root.glob("*.tar.gz") if path.is_file()), key=lambda item: item.name, reverse=True)
+
+
+def create_project_backup_archive(project_root: Path, *, label: str = "manual") -> Path:
+    root = backups_root(project_root)
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_label = re.sub(r"[^A-Za-z0-9._-]+", "-", label.strip() or "manual").strip("-") or "manual"
+    archive_path = root / f"heymate_backup_{stamp}_{safe_label}.tar.gz"
+    include_paths = [
+        project_root / ENV_FILE_NAME,
+        project_root / STATE_FILE_NAME,
+        project_root / "web_panel_runtime",
+        project_root / "terminal_sessions",
+        project_root / "deep_think_jobs",
+        project_root / "local_kb",
+        project_root / "project_contexts",
+        project_root / "task_queue",
+        project_root / "bot_logs",
+    ]
+    with tarfile.open(archive_path, "w:gz") as archive:
+        for path in include_paths:
+            if not path.exists():
+                continue
+            archive.add(path, arcname=str(path.relative_to(project_root)))
+    return archive_path
+
+
+def print_backups_overview(project_root: Path) -> list[Path]:
+    backups = list_project_backups(project_root)
+    if not backups:
+        print("Бэкапов пока нет. То есть живёшь дерзко и без сетки снизу.\n", flush=True)
+        return []
+    print("Последние бэкапы:", flush=True)
+    for index, path in enumerate(backups, start=1):
+        print(
+            f"{index}. {path.name} | {human_readable_download_size(path.stat().st_size)} | {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(path.stat().st_mtime))}",
+            flush=True,
+        )
+    print("", flush=True)
+    return backups
+
+
+def create_project_backup_from_launcher(project_root: Path) -> None:
+    cls()
+    backup_path = create_project_backup_archive(project_root)
+    print(
+        "Бэкап собрал.\n"
+        f"- Файл: {backup_path.name}\n"
+        f"- Путь: {backup_path}\n"
+        f"- Размер: {human_readable_download_size(backup_path.stat().st_size)}\n",
+        flush=True,
+    )
+    pause()
+
+
+def show_project_backups(project_root: Path) -> None:
+    cls()
+    print_backups_overview(project_root)
+    pause()
+
+
+def rollback_last_project_update(project_root: Path) -> None:
+    cls()
+    history = [item for item in list_update_history_records(project_root) if item.get("type") == "update"]
+    if not history:
+        print("Истории обновлений пока нет. Откатывать просто не на что.\n", flush=True)
+        pause()
+        return
+    if git_has_local_changes(project_root):
+        print(
+            "Git-дерево не чистое. Откат на грязном дереве делать не буду, а то потом сам будешь проклинать этот момент.\n",
+            flush=True,
+        )
+        pause()
+        return
+    record = history[-1]
+    target_sha = str(record.get("from_sha") or "").strip()
+    if not target_sha:
+        print("В истории обновлений нет SHA для отката. Тут уже магия закончилась.\n", flush=True)
+        pause()
+        return
+    print(
+        "Последнее обновление:\n"
+        f"- Было: {record.get('from_version') or target_sha[:7]}\n"
+        f"- Стало: {record.get('to_version') or str(record.get('to_sha') or '')[:7]}\n"
+        f"- Откатываю на: {target_sha[:7]}\n",
+        flush=True,
+    )
+    if not prompt_yes_no("Перед откатом сделать бэкап?", default=True):
+        backup_path = None
+    else:
+        backup_path = create_project_backup_archive(project_root, label="before-rollback")
+        print(f"Бэкап перед откатом собрал: {backup_path}\n", flush=True)
+    if not prompt_yes_no("Точно откатываю последнее обновление?", default=False):
+        print("Ок, откат отменил.\n", flush=True)
+        pause()
+        return
+    completed = run_capture_command(["git", "reset", "--hard", target_sha], cwd=project_root, timeout=60)
+    if completed is None or completed.returncode != 0:
+        print("Откат не удался. Git решил показать характер.\n", flush=True)
+        if completed is not None and (completed.stderr or completed.stdout):
+            print((completed.stderr or completed.stdout).strip() + "\n", flush=True)
+        pause()
+        return
+    append_update_history_record(
+        project_root,
+        {
+            "type": "rollback",
+            "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "target_sha": target_sha,
+            "target_version": str(record.get("from_version") or target_sha[:7]),
+            "backup_path": str(backup_path) if backup_path is not None else "",
+        },
+    )
+    print("Откат применил. Перезапускаю лаунчер...\n", flush=True)
+    time.sleep(1)
+    restart_launcher(project_root)
 
 
 def download_file(url: str, destination: Path, label: str) -> None:
@@ -2768,6 +3259,121 @@ def print_linux_hardware_profile(profile: dict[str, Any]) -> None:
     )
 
 
+def measure_file_read_speed_mib(path: Path, sample_bytes: int = 64 * 1024 * 1024) -> float | None:
+    if not path.is_file():
+        return None
+    try:
+        total_to_read = min(sample_bytes, max(1, path.stat().st_size))
+    except OSError:
+        return None
+    chunk_size = 1024 * 1024
+    started_at = time.perf_counter()
+    read_bytes = 0
+    try:
+        with path.open("rb") as handle:
+            while read_bytes < total_to_read:
+                chunk = handle.read(min(chunk_size, total_to_read - read_bytes))
+                if not chunk:
+                    break
+                read_bytes += len(chunk)
+    except OSError:
+        return None
+    elapsed = time.perf_counter() - started_at
+    if elapsed <= 0 or read_bytes <= 0:
+        return None
+    return round((read_bytes / (1024 ** 2)) / elapsed, 2)
+
+
+def guess_model_use_case(path: Path) -> str:
+    name = path.name.lower()
+    if any(marker in name for marker in ("coder", "code", "codestral", "deepseek-coder")):
+        return "код / рефактор / патчи"
+    if any(marker in name for marker in ("instruct", "chat", "assistant", "it")):
+        return "общий чат / инструкции"
+    if any(marker in name for marker in ("reason", "thinking", "r1")):
+        return "длинные рассуждения / сложные задачи"
+    return "универсальный режим без явной специализации"
+
+
+def build_model_fit_report(project_root: Path, state: dict[str, Any], model_path: Path) -> str:
+    model_profile = model_profile_for_path(model_path)
+    llama_server_exe = (
+        resolve_existing_file_path(state.get("llama_server_exe"), project_root)
+        or find_external_llama_server_exe(project_root)
+    )
+    llama_cpp_dir = (
+        resolve_existing_dir_path(state.get("llama_cpp_dir"), project_root)
+        or (llama_server_exe.parent if llama_server_exe is not None else None)
+    )
+    hardware_profile = (
+        detect_linux_hardware_profile(model_path, llama_cpp_dir, llama_server_exe, model_profile)
+        if llama_server_exe is not None and llama_cpp_dir is not None
+        else {"summary_lines": [], "overrides": {}}
+    )
+    ram_gib = read_linux_mem_total_gib() or 0.0
+    gpu = detect_linux_gpu()
+    try:
+        model_size_gib = model_path.stat().st_size / (1024 ** 3)
+    except OSError:
+        model_size_gib = 0.0
+    read_speed = measure_file_read_speed_mib(model_path)
+    n_gpu_layers = int((hardware_profile.get("overrides") or {}).get("N_GPU_LAYERS", "0") or 0)
+    verdict = "Влезает нормально"
+    if gpu is None and model_size_gib >= max(12.0, ram_gib * 0.9):
+        verdict = "Очень тяжёлая для CPU-only этой машины"
+    elif gpu is None and model_size_gib >= max(8.0, ram_gib * 0.6):
+        verdict = "Жить сможет, но готовься к тяжёлому CPU-only режиму"
+    elif gpu is not None and n_gpu_layers <= 0 and model_size_gib >= gpu.get("vram_gib", 0.0):
+        verdict = "GPU есть, но эта модель в основном ляжет на RAM/CPU"
+    elif gpu is not None and n_gpu_layers > 0:
+        verdict = "Есть шанс нормально разгрузить часть слоёв на GPU"
+    speed_line = (
+        f"- Быстрый диск-прогон: ~{read_speed:.1f} MiB/s\n"
+        if read_speed is not None
+        else "- Быстрый диск-прогон: не удалось измерить\n"
+    )
+    lines = [
+        "Fit-check модели:",
+        f"- Модель: {model_path.name}",
+        f"- Размер: {format_model_size(model_path)}",
+        f"- Предполагаемый профиль: {guess_model_use_case(model_path)}",
+        f"- Вердикт: {verdict}",
+        f"- RAM машины: {ram_gib:.1f} GiB",
+        (
+            f"- GPU: {gpu['name']} ({gpu['vram_gib']:.1f} GiB)"
+            if gpu is not None
+            else "- GPU: N/A"
+        ),
+        speed_line.rstrip(),
+    ]
+    summary_lines = hardware_profile.get("summary_lines") or []
+    if summary_lines:
+        lines.extend(f"- {line}" for line in summary_lines)
+    else:
+        lines.append("- llama-runtime ещё не найден, поэтому рекомендации по N_CTX/N_GPU_LAYERS урезаны.")
+    return "\n".join(lines)
+
+
+def run_model_fit_check_from_launcher(project_root: Path, state: dict[str, Any]) -> None:
+    cls()
+    current_model = resolve_current_model_path(project_root, state)
+    models = find_external_model_paths(project_root)
+    target_model = current_model
+    if target_model is None and models:
+        options = [format_model_choice(model_path) for model_path in models[:12]]
+        options.append("Назад")
+        choice = prompt_choice("Какую модель оценивать", options)
+        if choice == len(options):
+            return
+        target_model = models[choice - 1]
+    if target_model is None:
+        print("Модель для fit-check не нашёл. Тут даже анализировать пока нечего.\n", flush=True)
+        pause()
+        return
+    print(build_model_fit_report(project_root, state, target_model) + "\n", flush=True)
+    pause()
+
+
 def handle_model_support(project_root: Path, current_model: Path) -> Path:
     if model_supports_fast_reply(current_model):
         print_block(
@@ -3225,19 +3831,41 @@ def delete_terminal_session_from_launcher(project_root: Path) -> None:
         return
 
 
+def search_terminal_sessions_from_launcher(project_root: Path) -> None:
+    cls()
+    query = prompt_text("Поиск по названию/тегу/модели", allow_empty=True).strip()
+    if not query:
+        return
+    matches = search_terminal_sessions(project_root, query)
+    if not matches:
+        print("По такому запросу сессий не нашёл. Видимо, память у тебя лучше, чем у этого поиска.\n", flush=True)
+        pause()
+        return
+    print("Совпавшие сессии:", flush=True)
+    for session in matches:
+        tags = f" | теги: {', '.join(session['tags'])}" if session.get("tags") else ""
+        print(
+            f"#{session['session_number']} | {session['title']} | режим: {session.get('response_mode') or 'chat'}{tags}",
+            flush=True,
+        )
+    print("", flush=True)
+    pause()
+
+
 def sessions_menu(project_root: Path) -> None:
     while True:
         cls()
         print_block(
             """
             Здесь лежат сохранённые terminal-сессии.
-            Можно вернуться в старую переписку или снести её к чёрту по номеру.
+            Можно вернуться в старую переписку, поискать её по тегам/названию или снести к чёрту по номеру.
             """
         )
         choice = prompt_choice(
             "Сессии",
             [
                 "Посмотреть сессии",
+                "Поиск по сессиям",
                 "Удалить сессию",
                 "Назад",
             ],
@@ -3245,7 +3873,41 @@ def sessions_menu(project_root: Path) -> None:
         if choice == 1:
             open_terminal_session_from_launcher(project_root)
         elif choice == 2:
+            search_terminal_sessions_from_launcher(project_root)
+        elif choice == 3:
             delete_terminal_session_from_launcher(project_root)
+        else:
+            return
+
+
+def backups_menu(project_root: Path) -> None:
+    while True:
+        cls()
+        history = list_update_history_records(project_root)
+        updates = [item for item in history if item.get("type") == "update"]
+        last_update = updates[-1] if updates else None
+        print_block(
+            f"""
+            Бэкапы и откат.
+            Последний апдейт: {(last_update.get('to_version') if last_update else 'ещё не записывался')}.
+            Перед опасными движениями лучше иметь архив, а не только веру в лучшее.
+            """
+        )
+        choice = prompt_choice(
+            "Бэкапы и откат",
+            [
+                "Создать бэкап сейчас",
+                "Посмотреть список бэкапов",
+                "Откатить последнее обновление",
+                "Назад",
+            ],
+        )
+        if choice == 1:
+            create_project_backup_from_launcher(project_root)
+        elif choice == 2:
+            show_project_backups(project_root)
+        elif choice == 3:
+            rollback_last_project_update(project_root)
         else:
             return
 
@@ -4133,6 +4795,7 @@ def model_menu(project_root: Path, state: dict[str, Any]) -> None:
                 "Показать текущую и найденные модели",
                 "Быстро выбрать найденную модель",
                 "Сменить или скачать модель",
+                "Fit-check и быстрый прогон модели",
                 "Удалить текущую модель",
                 "Назад",
             ],
@@ -4145,6 +4808,8 @@ def model_menu(project_root: Path, state: dict[str, Any]) -> None:
             model_path = choose_model_path(project_root)
             apply_selected_model(project_root, state, model_path)
         elif choice == 4:
+            run_model_fit_check_from_launcher(project_root, state)
+        elif choice == 5:
             delete_current_model(project_root, state)
         else:
             return
@@ -4171,6 +4836,7 @@ def site_dashboard_menu(project_root: Path) -> None:
                 "Запустить и открыть в браузере",
                 "Показать статус и адрес",
                 "Показать лог веб-панели",
+                "Сеть, HTTPS и reverse proxy",
                 "Управление systemd service веб-панели",
                 "Остановить веб-панель",
                 "Назад",
@@ -4185,8 +4851,10 @@ def site_dashboard_menu(project_root: Path) -> None:
         elif choice == 4:
             show_site_dashboard_log(project_root)
         elif choice == 5:
-            site_dashboard_systemd_menu(project_root)
+            site_dashboard_network_menu(project_root)
         elif choice == 6:
+            site_dashboard_systemd_menu(project_root)
+        elif choice == 7:
             stop_site_dashboard(project_root)
         else:
             return
@@ -4294,6 +4962,7 @@ def launcher_menu(project_root: Path) -> None:
                 "Фоновые задачи",
                 "Веб-панель",
                 "Проверить обновление",
+                "Бэкапы и откат",
                 "Логи ошибок",
                 "Справка по порту",
                 "Менеджер моделей",
@@ -4322,17 +4991,19 @@ def launcher_menu(project_root: Path) -> None:
             check_for_project_update(project_root, show_if_latest=True)
             pause()
         elif choice == 9:
-            show_error_logs(project_root)
+            backups_menu(project_root)
         elif choice == 10:
-            show_port_manual()
+            show_error_logs(project_root)
         elif choice == 11:
+            show_port_manual()
+        elif choice == 12:
             model_menu(project_root, state)
             state = load_json(state_path)
-        elif choice == 12:
-            systemd_menu(project_root)
         elif choice == 13:
-            show_env(project_root)
+            systemd_menu(project_root)
         elif choice == 14:
+            show_env(project_root)
+        elif choice == 15:
             edit_env(project_root)
             state = load_json(state_path)
         else:

@@ -75,6 +75,10 @@ class SiteDashboardTests(unittest.TestCase):
         }
         (task_dir / "task_task1234.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
+    def _login_session(self) -> None:
+        with self.client.session_transaction() as session:
+            session["panel_authenticated"] = True
+
     def test_ensure_panel_state_generates_access_code_and_secret(self) -> None:
         self.assertTrue(self.generated_code)
         self.assertGreaterEqual(len(self.generated_code), 16)
@@ -83,15 +87,18 @@ class SiteDashboardTests(unittest.TestCase):
         self.assertTrue(self.state["site_enabled"])
 
     def test_failed_login_tracker_blocks_after_limit(self) -> None:
-        failures: dict[str, dict[str, float]] = {}
-        now = 1000.0
-        for _ in range(site_dashboard.LOGIN_FAILURE_LIMIT):
-            site_dashboard.register_failed_login(failures, "127.0.0.1", now=now)
+        state = site_dashboard.load_panel_state(self.state_path)
+        state["login_rate_limit_window_seconds"] = 60
+        state["login_rate_limit_max_attempts"] = 2
+        site_dashboard.save_panel_state(self.state_path, state)
 
-        self.assertGreater(
-            site_dashboard.get_login_block_remaining_seconds(failures, "127.0.0.1", now=now),
-            0,
-        )
+        with mock.patch("site_dashboard.time.time", side_effect=[1000.0, 1001.0, 1001.5]):
+            site_dashboard.record_failed_login_attempt(self.project_root, state, "127.0.0.1")
+            site_dashboard.record_failed_login_attempt(self.project_root, state, "127.0.0.1")
+            limited, max_attempts = site_dashboard.is_login_rate_limited(self.project_root, state, "127.0.0.1")
+
+        self.assertTrue(limited)
+        self.assertEqual(max_attempts, 2)
 
     def test_build_overview_payload_collects_jobs_tasks_and_files(self) -> None:
         self._write_long_think_result()
@@ -111,8 +118,7 @@ class SiteDashboardTests(unittest.TestCase):
         unauthorized = self.client.get("/api/overview")
         self.assertEqual(unauthorized.status_code, 401)
 
-        with self.client.session_transaction() as session:
-            session["panel_authenticated"] = True
+        self._login_session()
 
         with mock.patch("site_dashboard.collect_relevant_processes", return_value=[]):
             authorized = self.client.get("/api/overview")
@@ -122,7 +128,7 @@ class SiteDashboardTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["stats"]["result_file_count"], 1)
 
-    def test_dashboard_api_returns_403_when_site_disabled(self) -> None:
+    def test_dashboard_api_returns_423_when_site_disabled(self) -> None:
         with self.client.session_transaction() as session:
             session["panel_authenticated"] = True
 
@@ -132,19 +138,98 @@ class SiteDashboardTests(unittest.TestCase):
 
         response = self.client.get("/api/overview")
 
-        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 423)
         payload = response.get_json()
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"], "site_disabled")
 
     def test_manage_toggle_changes_site_state(self) -> None:
-        with self.client.session_transaction() as session:
-            session["panel_authenticated"] = True
+        self._login_session()
 
         response = self.client.post("/manage", data={"action": "toggle-site"}, follow_redirects=True)
         self.assertEqual(response.status_code, 200)
         updated = site_dashboard.load_panel_state(self.state_path)
         self.assertFalse(updated["site_enabled"])
+
+    def test_manage_updates_security_settings(self) -> None:
+        self._login_session()
+
+        response = self.client.post(
+            "/manage",
+            data={
+                "action": "update-security",
+                "ip_whitelist_text": "127.0.0.1\n203.0.113.0/24\nbad-value",
+                "login_rate_limit_window_seconds": "90",
+                "login_rate_limit_max_attempts": "3",
+            },
+            follow_redirects=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        updated = site_dashboard.load_panel_state(self.state_path)
+        self.assertEqual(updated["ip_whitelist_text"], "127.0.0.1\n203.0.113.0/24\nbad-value")
+        self.assertEqual(updated["login_rate_limit_window_seconds"], 90)
+        self.assertEqual(updated["login_rate_limit_max_attempts"], 3)
+
+    def test_ip_whitelist_blocks_non_matching_client(self) -> None:
+        state = site_dashboard.load_panel_state(self.state_path)
+        state["ip_whitelist_text"] = "203.0.113.10"
+        site_dashboard.save_panel_state(self.state_path, state)
+
+        response = self.client.get("/", environ_base={"REMOTE_ADDR": "198.51.100.20"})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/", response.headers.get("Location", ""))
+
+    def test_login_rate_limit_blocks_after_failures(self) -> None:
+        state = site_dashboard.load_panel_state(self.state_path)
+        state["login_rate_limit_window_seconds"] = 60
+        state["login_rate_limit_max_attempts"] = 2
+        site_dashboard.save_panel_state(self.state_path, state)
+
+        response1 = self.client.post(
+            "/login",
+            data={"access_code": "wrong"},
+            environ_base={"REMOTE_ADDR": "198.51.100.20"},
+            follow_redirects=True,
+        )
+        response2 = self.client.post(
+            "/login",
+            data={"access_code": "wrong"},
+            environ_base={"REMOTE_ADDR": "198.51.100.20"},
+            follow_redirects=True,
+        )
+        response3 = self.client.post(
+            "/login",
+            data={"access_code": "wrong"},
+            environ_base={"REMOTE_ADDR": "198.51.100.20"},
+            follow_redirects=True,
+        )
+
+        self.assertEqual(response1.status_code, 200)
+        self.assertEqual(response2.status_code, 200)
+        self.assertEqual(response3.status_code, 200)
+        self.assertIn("Слишком много неудачных входов", response3.get_data(as_text=True))
+
+    def test_artifact_and_logs_api_return_payloads(self) -> None:
+        self._login_session()
+        self._write_long_think_result()
+        (self.project_root / "bot_logs").mkdir(parents=True, exist_ok=True)
+        (self.project_root / "bot_logs" / "runtime.log").write_text("hello runtime", encoding="utf-8")
+
+        artifacts_response = self.client.get("/api/artifacts")
+        logs_response = self.client.get("/api/logs")
+        preview_response = self.client.get("/api/artifact", query_string={"path": "deep_think_jobs/job_demo/result.json"})
+
+        self.assertEqual(artifacts_response.status_code, 200)
+        self.assertEqual(logs_response.status_code, 200)
+        self.assertEqual(preview_response.status_code, 200)
+        artifacts_payload = artifacts_response.get_json()
+        logs_payload = logs_response.get_json()
+        preview_payload = preview_response.get_json()
+        self.assertTrue(artifacts_payload["artifacts"])
+        self.assertTrue(logs_payload["logs"])
+        self.assertIn("Готовый JSON-ответ от модели", preview_payload["preview_text"])
 
 
 if __name__ == "__main__":

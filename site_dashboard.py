@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import mimetypes
 import os
 import secrets
+import shutil
 import subprocess
 import time
 from datetime import datetime, timedelta
@@ -16,6 +19,7 @@ from flask import (
     abort,
     flash,
     jsonify,
+    send_file,
     redirect,
     render_template,
     request,
@@ -29,14 +33,23 @@ TEMPLATES_ROOT = PROJECT_ROOT / "site_dashboard_templates"
 STATIC_ROOT = PROJECT_ROOT / "site_dashboard_static"
 RUNTIME_ROOT = PROJECT_ROOT / "web_panel_runtime"
 DEFAULT_STATE_PATH = RUNTIME_ROOT / "panel_state.json"
-DEFAULT_HOST = os.getenv("SITE_DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
+DEFAULT_HOST = os.getenv("SITE_DASHBOARD_HOST", "0.0.0.0").strip() or "0.0.0.0"
 DEFAULT_PORT = int(os.getenv("SITE_DASHBOARD_PORT", "5080").strip() or "5080")
 REFRESH_INTERVAL_SECONDS = max(2, int(os.getenv("SITE_DASHBOARD_REFRESH_SECONDS", "4") or "4"))
 ACCESS_CODE_TOKEN_BYTES = 12
 MIN_ACCESS_CODE_LENGTH = 12
-LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
-LOGIN_FAILURE_LIMIT = 8
-LOGIN_LOCKOUT_SECONDS = 5 * 60
+DEFAULT_LOGIN_WINDOW_SECONDS = max(30, int(os.getenv("SITE_DASHBOARD_LOGIN_WINDOW_SECONDS", "600") or "600"))
+DEFAULT_LOGIN_MAX_ATTEMPTS = max(2, int(os.getenv("SITE_DASHBOARD_LOGIN_MAX_ATTEMPTS", "8") or "8"))
+RESOURCE_HISTORY_MAX_POINTS = max(30, int(os.getenv("SITE_DASHBOARD_RESOURCE_HISTORY_MAX_POINTS", "90") or "90"))
+LOG_TAIL_CHARS = max(2000, int(os.getenv("SITE_DASHBOARD_LOG_TAIL_CHARS", "18000") or "18000"))
+ARTIFACT_PREVIEW_CHARS = 16000
+PANEL_STATE_ALLOWED_ENDPOINTS_WHEN_DISABLED = {
+    "index",
+    "login",
+    "logout",
+    "manage",
+    "static",
+}
 SITE_PROCESS_KEYWORDS = (
     "site_dashboard.py",
     "bot.py",
@@ -83,6 +96,9 @@ def default_panel_state(access_code: str | None = None) -> tuple[dict[str, Any],
         "site_enabled": True,
         "access_code_hash": hash_access_code(generated_code),
         "session_secret": secrets.token_hex(32),
+        "ip_whitelist_text": "",
+        "login_rate_limit_window_seconds": DEFAULT_LOGIN_WINDOW_SECONDS,
+        "login_rate_limit_max_attempts": DEFAULT_LOGIN_MAX_ATTEMPTS,
         "created_at": iso_now(),
         "updated_at": iso_now(),
         "access_code_changed_at": iso_now(),
@@ -97,6 +113,15 @@ def ensure_panel_state(state_path: Path) -> tuple[dict[str, Any], str | None]:
             "site_enabled": bool(existing.get("site_enabled", True)),
             "access_code_hash": str(existing.get("access_code_hash") or ""),
             "session_secret": str(existing.get("session_secret") or ""),
+            "ip_whitelist_text": str(existing.get("ip_whitelist_text") or ""),
+            "login_rate_limit_window_seconds": max(
+                30,
+                int(existing.get("login_rate_limit_window_seconds") or DEFAULT_LOGIN_WINDOW_SECONDS),
+            ),
+            "login_rate_limit_max_attempts": max(
+                2,
+                int(existing.get("login_rate_limit_max_attempts") or DEFAULT_LOGIN_MAX_ATTEMPTS),
+            ),
             "created_at": str(existing.get("created_at") or iso_now()),
             "updated_at": str(existing.get("updated_at") or iso_now()),
             "access_code_changed_at": str(existing.get("access_code_changed_at") or existing.get("updated_at") or iso_now()),
@@ -140,57 +165,6 @@ def verify_access_code(state: dict[str, Any], access_code: str) -> bool:
     return bool(access_code) and hash_access_code(access_code.strip()) == str(state.get("access_code_hash") or "")
 
 
-def get_client_identity() -> str:
-    forwarded_for = str(request.headers.get("X-Forwarded-For") or "").strip()
-    if forwarded_for:
-        return forwarded_for.split(",", 1)[0].strip() or "unknown"
-    return str(request.remote_addr or "unknown").strip() or "unknown"
-
-
-def prune_login_failures(store: dict[str, dict[str, float]], now: float | None = None) -> None:
-    current_time = now if now is not None else time.time()
-    stale_keys = [
-        client_id
-        for client_id, payload in store.items()
-        if current_time - float(payload.get("updated_at") or 0.0) > LOGIN_FAILURE_WINDOW_SECONDS
-    ]
-    for client_id in stale_keys:
-        store.pop(client_id, None)
-
-
-def register_failed_login(store: dict[str, dict[str, float]], client_id: str, now: float | None = None) -> None:
-    current_time = now if now is not None else time.time()
-    prune_login_failures(store, current_time)
-    payload = store.get(client_id, {"count": 0.0, "updated_at": current_time, "blocked_until": 0.0})
-    count = int(payload.get("count") or 0) + 1
-    blocked_until = float(payload.get("blocked_until") or 0.0)
-    if count >= LOGIN_FAILURE_LIMIT:
-        blocked_until = current_time + LOGIN_LOCKOUT_SECONDS
-    store[client_id] = {
-        "count": float(count),
-        "updated_at": current_time,
-        "blocked_until": blocked_until,
-    }
-
-
-def clear_failed_login(store: dict[str, dict[str, float]], client_id: str) -> None:
-    store.pop(client_id, None)
-
-
-def get_login_block_remaining_seconds(
-    store: dict[str, dict[str, float]],
-    client_id: str,
-    now: float | None = None,
-) -> int:
-    current_time = now if now is not None else time.time()
-    prune_login_failures(store, current_time)
-    payload = store.get(client_id) or {}
-    blocked_until = float(payload.get("blocked_until") or 0.0)
-    if blocked_until <= current_time:
-        return 0
-    return int(blocked_until - current_time + 0.999)
-
-
 def parse_iso_datetime(value: Any) -> datetime | None:
     text = str(value or "").strip()
     if not text:
@@ -229,6 +203,349 @@ def format_duration(seconds: Any) -> str:
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def runtime_root_for_project(project_root: Path) -> Path:
+    return project_root / "web_panel_runtime"
+
+
+def login_guard_state_path(project_root: Path) -> Path:
+    return runtime_root_for_project(project_root) / "login_guard_state.json"
+
+
+def resource_history_state_path(project_root: Path) -> Path:
+    return runtime_root_for_project(project_root) / "resource_history.json"
+
+
+def read_text_tail(path: Path, max_chars: int = LOG_TAIL_CHARS) -> str:
+    if not path.is_file():
+        return "Лог пока не найден."
+    return path.read_text(encoding="utf-8", errors="ignore")[-max_chars:].strip() or "Лог пуст."
+
+
+def normalize_ip_whitelist_text(value: str) -> str:
+    lines = [line.strip() for line in str(value or "").replace(",", "\n").splitlines()]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        normalized.append(line)
+    return "\n".join(normalized)
+
+
+def parse_ip_whitelist_entries(raw_value: str) -> list[str]:
+    parsed: list[str] = []
+    for line in normalize_ip_whitelist_text(raw_value).splitlines():
+        try:
+            if "/" in line:
+                parsed.append(str(ipaddress.ip_network(line, strict=False)))
+            else:
+                parsed.append(str(ipaddress.ip_address(line)))
+        except ValueError:
+            continue
+    return parsed
+
+
+def get_request_ip() -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "").strip()
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()
+    return (request.remote_addr or "").strip()
+
+
+def is_ip_allowed(state: dict[str, Any], ip_value: str) -> bool:
+    whitelist_entries = parse_ip_whitelist_entries(str(state.get("ip_whitelist_text") or ""))
+    if not whitelist_entries:
+        return True
+    try:
+        ip_obj = ipaddress.ip_address(ip_value)
+    except ValueError:
+        return False
+    for entry in whitelist_entries:
+        if "/" in entry:
+            if ip_obj in ipaddress.ip_network(entry, strict=False):
+                return True
+        elif ip_obj == ipaddress.ip_address(entry):
+            return True
+    return False
+
+
+def load_login_guard_state(project_root: Path) -> dict[str, Any]:
+    return read_json_file(login_guard_state_path(project_root))
+
+
+def save_login_guard_state(project_root: Path, payload: dict[str, Any]) -> None:
+    atomic_write_json(login_guard_state_path(project_root), payload)
+
+
+def prune_login_guard_state(payload: dict[str, Any], *, now_ts: float, window_seconds: int) -> dict[str, Any]:
+    attempts = payload.get("attempts")
+    if not isinstance(attempts, dict):
+        attempts = {}
+    cleaned: dict[str, list[float]] = {}
+    for ip_value, stamps in attempts.items():
+        if not isinstance(stamps, list):
+            continue
+        recent = [float(stamp) for stamp in stamps if now_ts - float(stamp) <= window_seconds]
+        if recent:
+            cleaned[str(ip_value)] = recent[-64:]
+    return {"attempts": cleaned}
+
+
+def is_login_rate_limited(project_root: Path, state: dict[str, Any], ip_value: str) -> tuple[bool, int]:
+    window_seconds = max(30, int(state.get("login_rate_limit_window_seconds") or DEFAULT_LOGIN_WINDOW_SECONDS))
+    max_attempts = max(2, int(state.get("login_rate_limit_max_attempts") or DEFAULT_LOGIN_MAX_ATTEMPTS))
+    now_ts = time.time()
+    payload = prune_login_guard_state(load_login_guard_state(project_root), now_ts=now_ts, window_seconds=window_seconds)
+    save_login_guard_state(project_root, payload)
+    attempts = list(payload.get("attempts", {}).get(ip_value, []))
+    limited = len(attempts) >= max_attempts
+    return limited, max_attempts
+
+
+def record_failed_login_attempt(project_root: Path, state: dict[str, Any], ip_value: str) -> tuple[int, int]:
+    window_seconds = max(30, int(state.get("login_rate_limit_window_seconds") or DEFAULT_LOGIN_WINDOW_SECONDS))
+    max_attempts = max(2, int(state.get("login_rate_limit_max_attempts") or DEFAULT_LOGIN_MAX_ATTEMPTS))
+    now_ts = time.time()
+    payload = prune_login_guard_state(load_login_guard_state(project_root), now_ts=now_ts, window_seconds=window_seconds)
+    attempts = list(payload.get("attempts", {}).get(ip_value, []))
+    attempts.append(now_ts)
+    payload.setdefault("attempts", {})[ip_value] = attempts[-64:]
+    save_login_guard_state(project_root, payload)
+    remaining = max(0, max_attempts - len(payload["attempts"][ip_value]))
+    return remaining, window_seconds
+
+
+def clear_failed_login_attempts(project_root: Path, ip_value: str) -> None:
+    payload = load_login_guard_state(project_root)
+    attempts = payload.get("attempts")
+    if isinstance(attempts, dict) and ip_value in attempts:
+        attempts.pop(ip_value, None)
+        save_login_guard_state(project_root, {"attempts": attempts})
+
+
+def collect_panel_log_payload(project_root: Path) -> list[dict[str, Any]]:
+    runtime_root = runtime_root_for_project(project_root)
+    sources = [
+        ("runtime.log", project_root / "bot_logs" / "runtime.log"),
+        ("systemd_supervisor.log", project_root / "bot_logs" / "systemd_supervisor.log"),
+        ("llama_server.log", project_root / "bot_logs" / "llama_server.log"),
+        ("site_dashboard.log", runtime_root / "site_dashboard.log"),
+    ]
+    payload: list[dict[str, Any]] = []
+    for label, path in sources:
+        payload.append(
+            {
+                "name": label,
+                "path": str(path),
+                "exists": path.is_file(),
+                "tail": read_text_tail(path),
+            }
+        )
+    return payload
+
+
+def collect_artifact_files(project_root: Path, *, limit: int = 120) -> list[dict[str, Any]]:
+    roots = [
+        project_root / "deep_think_jobs",
+        project_root / "terminal_sessions" / "exports",
+        project_root / "backups",
+    ]
+    files: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        if root.is_file():
+            candidates = [root]
+        else:
+            candidates = sorted(root.rglob("*"))
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            try:
+                resolved = candidate.resolve()
+            except Exception:
+                resolved = candidate
+            marker = str(resolved)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            try:
+                relative_path = resolved.relative_to(project_root)
+            except Exception:
+                relative_path = resolved
+            suffix = resolved.suffix.lower()
+            mime_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+            try:
+                stat = resolved.stat()
+                size_bytes = int(stat.st_size)
+                updated_at = datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat()
+            except OSError:
+                size_bytes = 0
+                updated_at = ""
+            files.append(
+                {
+                    "relative_path": str(relative_path),
+                    "path": str(resolved),
+                    "name": resolved.name,
+                    "directory": str(relative_path.parent) if hasattr(relative_path, "parent") else "",
+                    "suffix": suffix,
+                    "mime_type": mime_type,
+                    "size_bytes": size_bytes,
+                    "updated_at": updated_at,
+                    "is_previewable": suffix in {".json", ".md", ".txt", ".log", ".yml", ".yaml", ".ini", ".cfg"},
+                }
+            )
+            if len(files) >= limit:
+                return sort_payloads_by_timestamp(files, ("updated_at",))
+    return sort_payloads_by_timestamp(files, ("updated_at",))
+
+
+def resolve_artifact_path(project_root: Path, relative_path: str) -> Path | None:
+    normalized = str(relative_path or "").strip().lstrip("/").replace("\\", "/")
+    if not normalized:
+        return None
+    candidate = (project_root / normalized).resolve()
+    allowed_roots = [
+        (project_root / "deep_think_jobs").resolve(),
+        (project_root / "terminal_sessions" / "exports").resolve(),
+        (project_root / "backups").resolve(),
+    ]
+    if not candidate.is_file():
+        return None
+    if not any(str(candidate).startswith(str(root) + os.sep) or candidate == root for root in allowed_roots if root.exists()):
+        return None
+    return candidate
+
+
+def preview_artifact_file(project_root: Path, relative_path: str) -> dict[str, Any] | None:
+    artifact_path = resolve_artifact_path(project_root, relative_path)
+    if artifact_path is None:
+        return None
+    suffix = artifact_path.suffix.lower()
+    if suffix == ".json":
+        payload = read_json_file(artifact_path)
+        if payload:
+            preview_text = json.dumps(payload, ensure_ascii=False, indent=2)
+        else:
+            preview_text = artifact_path.read_text(encoding="utf-8", errors="ignore")
+    else:
+        preview_text = artifact_path.read_text(encoding="utf-8", errors="ignore")
+    return {
+        "relative_path": relative_path,
+        "path": str(artifact_path),
+        "preview_text": preview_text[:ARTIFACT_PREVIEW_CHARS],
+        "truncated": len(preview_text) > ARTIFACT_PREVIEW_CHARS,
+    }
+
+
+def read_proc_cpu_snapshot() -> tuple[int, int] | None:
+    proc_stat_path = Path("/proc/stat")
+    if not proc_stat_path.is_file():
+        return None
+    try:
+        for raw_line in proc_stat_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not raw_line.startswith("cpu "):
+                continue
+            parts = raw_line.split()
+            values = [int(value) for value in parts[1:8]]
+            idle = values[3] + values[4]
+            total = sum(values)
+            return total, idle
+    except Exception:
+        return None
+    return None
+
+
+def compute_cpu_percent(previous: tuple[int, int] | None, current: tuple[int, int] | None) -> float | None:
+    if previous is None or current is None:
+        return None
+    total_delta = current[0] - previous[0]
+    idle_delta = current[1] - previous[1]
+    if total_delta <= 0:
+        return None
+    return round(max(0.0, min(100.0, (1.0 - (idle_delta / total_delta)) * 100.0)), 2)
+
+
+def read_ram_percent() -> float | None:
+    meminfo_path = Path("/proc/meminfo")
+    if not meminfo_path.is_file():
+        return None
+    totals: dict[str, int] = {}
+    try:
+        for raw_line in meminfo_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if ":" not in raw_line:
+                continue
+            key, value = raw_line.split(":", 1)
+            parts = value.strip().split()
+            if not parts or not parts[0].isdigit():
+                continue
+            totals[key.strip()] = int(parts[0])
+    except Exception:
+        return None
+    total_kib = totals.get("MemTotal")
+    available_kib = totals.get("MemAvailable")
+    if not total_kib or not available_kib:
+        return None
+    used_ratio = 1.0 - (available_kib / total_kib)
+    return round(max(0.0, min(100.0, used_ratio * 100.0)), 2)
+
+
+def read_gpu_percent() -> float | None:
+    executable = shutil.which("nvidia-smi")
+    if executable:
+        try:
+            completed = subprocess.run(
+                [executable, "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if completed.returncode == 0:
+                values = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+                if values:
+                    numeric = [float(value) for value in values if value.replace(".", "", 1).isdigit()]
+                    if numeric:
+                        return round(sum(numeric) / len(numeric), 2)
+        except Exception:
+            return None
+    return None
+
+
+def update_resource_history(project_root: Path) -> dict[str, Any]:
+    history_path = resource_history_state_path(project_root)
+    payload = read_json_file(history_path)
+    samples = payload.get("samples")
+    if not isinstance(samples, list):
+        samples = []
+    previous_cpu_total = payload.get("previous_cpu_total")
+    previous_cpu_idle = payload.get("previous_cpu_idle")
+    previous_cpu_snapshot = None
+    if isinstance(previous_cpu_total, int) and isinstance(previous_cpu_idle, int):
+        previous_cpu_snapshot = (previous_cpu_total, previous_cpu_idle)
+    current_cpu_snapshot = read_proc_cpu_snapshot()
+    sample = {
+        "timestamp": iso_now(),
+        "cpu_percent": compute_cpu_percent(previous_cpu_snapshot, current_cpu_snapshot),
+        "ram_percent": read_ram_percent(),
+        "gpu_percent": read_gpu_percent(),
+    }
+    samples.append(sample)
+    samples = samples[-RESOURCE_HISTORY_MAX_POINTS:]
+    new_payload = {
+        "previous_cpu_total": current_cpu_snapshot[0] if current_cpu_snapshot is not None else previous_cpu_total,
+        "previous_cpu_idle": current_cpu_snapshot[1] if current_cpu_snapshot is not None else previous_cpu_idle,
+        "samples": samples,
+    }
+    atomic_write_json(history_path, new_payload)
+    return {
+        "current": sample,
+        "history": samples,
+    }
 
 
 def collect_relevant_processes(project_root: Path) -> list[dict[str, Any]]:
@@ -369,6 +686,8 @@ def build_overview_payload(project_root: Path) -> dict[str, Any]:
     result_files = list_generated_result_files(project_root)
     tasks = list_background_tasks(project_root)
     processes = collect_relevant_processes(project_root)
+    artifacts = collect_artifact_files(project_root)
+    resources = update_resource_history(project_root)
     active_job_count = sum(1 for job in jobs if job["status"] in {"queued", "running"})
     running_task_count = sum(1 for task in tasks if task["status"] in {"queued", "running"})
     return {
@@ -384,6 +703,10 @@ def build_overview_payload(project_root: Path) -> dict[str, Any]:
         "long_think_jobs": jobs[:16],
         "result_files": result_files[:20],
         "background_tasks": tasks[:20],
+        "artifacts": artifacts[:80],
+        "logs": collect_panel_log_payload(project_root),
+        "system_resources": resources["current"],
+        "resource_history": resources["history"],
     }
 
 
@@ -404,7 +727,6 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
     root = (project_root or PROJECT_ROOT).resolve()
     panel_state_path = state_path or (root / "web_panel_runtime" / "panel_state.json")
     panel_state, generated_code = ensure_panel_state(panel_state_path)
-    login_failures: dict[str, dict[str, float]] = {}
 
     app = Flask(
         __name__,
@@ -426,9 +748,27 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
         if bool(state.get("site_enabled", True)):
             return None
         if request.path.startswith("/api/"):
-            return jsonify({"ok": False, "error": "site_disabled"}), 403
-        flash("Панель сейчас выключена. Включи её сначала в manage-разделе.", "error")
-        return redirect(url_for("manage"))
+            return jsonify({"ok": False, "error": "site_disabled"}), 423
+        flash("Панель сейчас выключена. Включи её в управлении сайтом, и потом уже командуй.", "error")
+        return redirect(url_for("manage" if is_panel_authenticated() else "index"))
+
+    @app.before_request
+    def enforce_panel_restrictions():
+        state = load_panel_state(app.config["PANEL_STATE_PATH"])
+        request_ip = get_request_ip()
+        if request.endpoint == "static":
+            return None
+        if not is_ip_allowed(state, request_ip):
+            if request.path.startswith("/api/"):
+                return jsonify({"ok": False, "error": "ip_forbidden"}), 403
+            flash(f"IP {request_ip or '-'} не входит в whitelist панели.", "error")
+            return redirect(url_for("index"))
+        if not bool(state.get("site_enabled", True)) and request.endpoint not in PANEL_STATE_ALLOWED_ENDPOINTS_WHEN_DISABLED:
+            if request.path.startswith("/api/"):
+                return jsonify({"ok": False, "error": "site_disabled"}), 423
+            flash("Панель сейчас выключена. Включи её в управлении сайтом, и потом уже командуй.", "error")
+            return redirect(url_for("manage" if is_panel_authenticated() else "index"))
+        return None
 
     @app.context_processor
     def inject_global_state() -> dict[str, Any]:
@@ -436,6 +776,7 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
         return {
             "site_enabled": bool(state.get("site_enabled", True)),
             "panel_authenticated": is_panel_authenticated(),
+            "panel_ip_whitelist_text": str(state.get("ip_whitelist_text") or ""),
         }
 
     @app.get("/")
@@ -450,24 +791,29 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
     @app.post("/login")
     def login():
         state = load_panel_state(app.config["PANEL_STATE_PATH"])
-        client_id = get_client_identity()
-        lock_remaining = get_login_block_remaining_seconds(login_failures, client_id)
-        if lock_remaining > 0:
+        project_root = app.config["PROJECT_ROOT"]
+        request_ip = get_request_ip()
+        limited, max_attempts = is_login_rate_limited(project_root, state, request_ip)
+        if limited:
             flash(
-                f"Слишком много неудачных попыток входа. Подожди {lock_remaining} сек. и попробуй ещё раз.",
+                f"Слишком много неудачных входов с IP {request_ip or '-'}. Подожди и попробуй снова.",
                 "error",
             )
             return redirect(url_for("index"))
         access_code = request.form.get("access_code", "").strip()
         if verify_access_code(state, access_code):
-            clear_failed_login(login_failures, client_id)
             session["panel_authenticated"] = True
             session.permanent = True
+            clear_failed_login_attempts(project_root, request_ip)
             flash("Код доступа принят. Теперь можно крутить эту панель как хочешь.", "success")
             target = request.form.get("next") or url_for("dashboard")
             return redirect(target)
-        register_failed_login(login_failures, client_id)
+        remaining, window_seconds = record_failed_login_attempt(project_root, state, request_ip)
         flash("Код доступа мимо кассы. Проверь, что вводишь, а не набор боли.", "error")
+        flash(
+            f"Осталось попыток в окне {window_seconds} сек.: {remaining}/{max_attempts}.",
+            "info",
+        )
         return redirect(url_for("index"))
 
     @app.post("/logout")
@@ -508,6 +854,27 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
                     save_panel_state(app.config["PANEL_STATE_PATH"], state)
                     flash("Код доступа обновил. Старый теперь бесполезен, как обещания кривого VPN.", "success")
                 return redirect(url_for("manage"))
+            if action == "update-security":
+                state["ip_whitelist_text"] = normalize_ip_whitelist_text(
+                    request.form.get("ip_whitelist_text", "")
+                )
+                try:
+                    state["login_rate_limit_window_seconds"] = max(
+                        30,
+                        int(request.form.get("login_rate_limit_window_seconds", DEFAULT_LOGIN_WINDOW_SECONDS)),
+                    )
+                except (TypeError, ValueError):
+                    state["login_rate_limit_window_seconds"] = DEFAULT_LOGIN_WINDOW_SECONDS
+                try:
+                    state["login_rate_limit_max_attempts"] = max(
+                        2,
+                        int(request.form.get("login_rate_limit_max_attempts", DEFAULT_LOGIN_MAX_ATTEMPTS)),
+                    )
+                except (TypeError, ValueError):
+                    state["login_rate_limit_max_attempts"] = DEFAULT_LOGIN_MAX_ATTEMPTS
+                save_panel_state(app.config["PANEL_STATE_PATH"], state)
+                flash("Настройки whitelist и rate-limit обновил.", "success")
+                return redirect(url_for("manage"))
             flash("Неизвестное действие. Панель не умеет читать мысли, только формы.", "error")
             return redirect(url_for("manage"))
 
@@ -515,6 +882,9 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
             "site_dashboard_manage.html",
             site_enabled=bool(state.get("site_enabled", True)),
             access_code_changed_at=str(state.get("access_code_changed_at") or "-"),
+            ip_whitelist_text=str(state.get("ip_whitelist_text") or ""),
+            login_rate_limit_window_seconds=int(state.get("login_rate_limit_window_seconds") or DEFAULT_LOGIN_WINDOW_SECONDS),
+            login_rate_limit_max_attempts=int(state.get("login_rate_limit_max_attempts") or DEFAULT_LOGIN_MAX_ATTEMPTS),
         )
 
     @app.get("/dashboard")
@@ -544,6 +914,16 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
         payload["ok"] = True
         return jsonify(payload)
 
+    @app.get("/api/logs")
+    @login_required
+    def api_logs():
+        return jsonify({"ok": True, "logs": collect_panel_log_payload(app.config["PROJECT_ROOT"])})
+
+    @app.get("/api/artifacts")
+    @login_required
+    def api_artifacts():
+        return jsonify({"ok": True, "artifacts": collect_artifact_files(app.config["PROJECT_ROOT"])})
+
     @app.get("/api/file/<job_id>")
     @login_required
     def api_file(job_id: str):
@@ -566,6 +946,24 @@ def create_app(project_root: Path | None = None, state_path: Path | None = None)
                     }
                 )
         abort(404)
+
+    @app.get("/api/artifact")
+    @login_required
+    def api_artifact():
+        relative_path = request.args.get("path", "").strip()
+        payload = preview_artifact_file(app.config["PROJECT_ROOT"], relative_path)
+        if payload is None:
+            abort(404)
+        return jsonify({"ok": True, **payload})
+
+    @app.get("/api/artifact-download")
+    @login_required
+    def api_artifact_download():
+        relative_path = request.args.get("path", "").strip()
+        artifact_path = resolve_artifact_path(app.config["PROJECT_ROOT"], relative_path)
+        if artifact_path is None:
+            abort(404)
+        return send_file(artifact_path, as_attachment=True, download_name=artifact_path.name)
 
     if generated_code:
         print(

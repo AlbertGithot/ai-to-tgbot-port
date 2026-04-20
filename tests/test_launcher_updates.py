@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import launcher_cli
 
@@ -77,6 +78,34 @@ class LauncherUpdateRegressionTests(unittest.TestCase):
             (self.local_repo / "VERSION.txt").read_text(encoding="utf-8"),
             "34ee80d\n",
         )
+
+    def test_rollback_last_project_update_resets_to_previous_sha(self) -> None:
+        initial_sha = launcher_cli.current_git_head_sha(self.local_repo)
+        (self.local_repo / launcher_cli.STATE_FILE_NAME).write_text("{}", encoding="utf-8")
+        (self.local_repo / "README.md").write_text("new local state\n", encoding="utf-8")
+        self.run_git(self.local_repo, "commit", "-am", "local new state")
+        updated_sha = launcher_cli.current_git_head_sha(self.local_repo)
+        launcher_cli.record_installed_project_update(
+            self.local_repo,
+            {
+                "branch": "linux",
+                "local_sha": initial_sha,
+                "remote_sha": updated_sha,
+                "local_version": initial_sha[:7],
+                "remote_version": updated_sha[:7],
+            },
+        )
+
+        with mock.patch("launcher_cli.prompt_yes_no", side_effect=[False, True]), mock.patch(
+            "launcher_cli.git_has_local_changes",
+            return_value=False,
+        ), mock.patch(
+            "launcher_cli.pause"
+        ), mock.patch("launcher_cli.restart_launcher") as restart_mock:
+            launcher_cli.rollback_last_project_update(self.local_repo)
+
+        self.assertEqual(launcher_cli.current_git_head_sha(self.local_repo), initial_sha)
+        restart_mock.assert_called_once()
 
 
 if __name__ == "__main__":

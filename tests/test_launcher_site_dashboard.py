@@ -131,6 +131,60 @@ class LauncherSiteDashboardTests(unittest.TestCase):
         self.assertIn("Environment=SITE_DASHBOARD_REFRESH_SECONDS=11", service_text)
         self.assertIn("WantedBy=multi-user.target", service_text)
 
+    def test_save_site_dashboard_network_settings_writes_public_host(self) -> None:
+        launcher_cli.save_site_dashboard_network_settings(
+            self.project_root,
+            host="127.0.0.1",
+            public_host="panel.example.com",
+            port=7443,
+            refresh_seconds=8,
+        )
+
+        env_values = launcher_cli.parse_env_file(self.project_root / launcher_cli.ENV_FILE_NAME)
+
+        self.assertEqual(env_values["SITE_DASHBOARD_HOST"], "127.0.0.1")
+        self.assertEqual(env_values["SITE_DASHBOARD_PUBLIC_HOST"], "panel.example.com")
+        self.assertEqual(env_values["SITE_DASHBOARD_PORT"], "7443")
+        self.assertEqual(env_values["SITE_DASHBOARD_REFRESH_SECONDS"], "8")
+
+    def test_write_site_dashboard_reverse_proxy_configs_creates_two_files(self) -> None:
+        caddy_path, nginx_path = launcher_cli.write_site_dashboard_reverse_proxy_configs(
+            self.project_root,
+            "panel.example.com",
+        )
+
+        self.assertTrue(caddy_path.is_file())
+        self.assertTrue(nginx_path.is_file())
+        self.assertIn("panel.example.com", caddy_path.read_text(encoding="utf-8"))
+        self.assertIn("proxy_pass http://127.0.0.1:5080;", nginx_path.read_text(encoding="utf-8"))
+
+    def test_create_project_backup_archive_contains_env(self) -> None:
+        env_path = self.project_root / launcher_cli.ENV_FILE_NAME
+        env_path.write_text("BOT_TOKEN=test\n", encoding="utf-8")
+
+        backup_path = launcher_cli.create_project_backup_archive(self.project_root, label="test")
+
+        self.assertTrue(backup_path.is_file())
+        self.assertIn("heymate_backup_", backup_path.name)
+
+    def test_record_installed_project_update_appends_history(self) -> None:
+        launcher_cli.record_installed_project_update(
+            self.project_root,
+            {
+                "branch": "linux",
+                "local_sha": "1111111",
+                "remote_sha": "2222222",
+                "local_version": "1.0.0",
+                "remote_version": "1.1.0",
+            },
+        )
+
+        history = launcher_cli.list_update_history_records(self.project_root)
+
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["type"], "update")
+        self.assertEqual(history[0]["to_version"], "1.1.0")
+
 
 if __name__ == "__main__":
     unittest.main()

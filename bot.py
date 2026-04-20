@@ -662,6 +662,8 @@ LIVE_STATUS_BAR_WIDTH = max(14, env_int("LIVE_STATUS_BAR_WIDTH", 22))
 LONG_THINK_ROOT = PROJECT_ROOT / "deep_think_jobs"
 TERMINAL_SESSIONS_ROOT = PROJECT_ROOT / "terminal_sessions"
 TERMINAL_SESSION_TITLE_CHARS = max(20, env_int("TERMINAL_SESSION_TITLE_CHARS", 80))
+TERMINAL_SESSION_MAX_TAGS = max(1, env_int("TERMINAL_SESSION_MAX_TAGS", 8))
+TERMINAL_SESSION_TAG_CHARS = max(3, env_int("TERMINAL_SESSION_TAG_CHARS", 24))
 TERMINAL_CLIPBOARD_MAX_CHARS = max(1000, env_int("TERMINAL_CLIPBOARD_MAX_CHARS", 32000))
 TERMINAL_CLIPBOARD_PREVIEW_CHARS = max(80, env_int("TERMINAL_CLIPBOARD_PREVIEW_CHARS", 220))
 SUPERVISOR_RESTART_BASE_DELAY_SECONDS = max(
@@ -687,6 +689,7 @@ LONG_THINK_MAX_DURATION_SECONDS = max(
     env_int("LONG_THINK_MAX_DURATION_SECONDS", 86400),
 )
 LONG_THINK_MAX_ITERATIONS = max(1, env_int("LONG_THINK_MAX_ITERATIONS", 24))
+LONG_THINK_SNAPSHOT_MAX_FILES = max(4, env_int("LONG_THINK_SNAPSHOT_MAX_FILES", 48))
 LONG_THINK_STEP_MAX_TOKENS = max(
     512, env_int("LONG_THINK_STEP_MAX_TOKENS", min(MAX_TOKENS, 4096))
 )
@@ -966,6 +969,30 @@ def build_terminal_session_title(text: str) -> str:
     if not collapsed:
         return "Без названия"
     return truncate_text(collapsed, TERMINAL_SESSION_TITLE_CHARS)
+
+
+def normalize_terminal_session_tags(raw_tags: Any) -> list[str]:
+    if isinstance(raw_tags, str):
+        candidates = re.split(r"[,;\n]+", raw_tags)
+    elif isinstance(raw_tags, list):
+        candidates = [str(item or "") for item in raw_tags]
+    else:
+        candidates = []
+    tags: list[str] = []
+    seen: set[str] = set()
+    for raw_tag in candidates:
+        normalized = " ".join(str(raw_tag or "").strip().split())
+        if not normalized:
+            continue
+        normalized = truncate_text(normalized, TERMINAL_SESSION_TAG_CHARS)
+        marker = normalized.casefold()
+        if marker in seen:
+            continue
+        seen.add(marker)
+        tags.append(normalized)
+        if len(tags) >= TERMINAL_SESSION_MAX_TAGS:
+            break
+    return tags
 
 
 def normalize_terminal_clipboard_text(raw_text: Any) -> str:
@@ -2069,10 +2096,12 @@ def cancel_background_task(task: dict[str, Any]) -> None:
 
 def create_terminal_session_payload(session_number: int) -> dict[str, Any]:
     now = iso_now()
+    current_model = resolve_model_candidate(MODEL_PATH)
     return {
         "session_number": session_number,
         "session_id": uuid.uuid4().hex,
         "title": "",
+        "tags": [],
         "created_at": now,
         "updated_at": now,
         "last_opened_at": now,
@@ -2083,6 +2112,8 @@ def create_terminal_session_payload(session_number: int) -> dict[str, Any]:
         "clipboard_text": "",
         "last_user_text": "",
         "last_bot_text": "",
+        "attached_model_path": str(current_model or MODEL_PATH),
+        "attached_model_name": current_model.name if current_model is not None else Path(str(MODEL_PATH)).name,
         "settings": normalize_dialog_runtime_settings(),
         "history": [],
     }
@@ -2096,6 +2127,7 @@ def save_terminal_session(session: dict[str, Any]) -> None:
         "session_number": session_number,
         "session_id": str(session.get("session_id") or uuid.uuid4().hex),
         "title": str(session.get("title") or "").strip(),
+        "tags": normalize_terminal_session_tags(session.get("tags")),
         "created_at": str(session.get("created_at") or iso_now()),
         "updated_at": str(session.get("updated_at") or iso_now()),
         "last_opened_at": str(session.get("last_opened_at") or iso_now()),
@@ -2106,6 +2138,8 @@ def save_terminal_session(session: dict[str, Any]) -> None:
         "clipboard_text": normalize_terminal_clipboard_text(session.get("clipboard_text")),
         "last_user_text": normalize_terminal_clipboard_text(session.get("last_user_text")),
         "last_bot_text": normalize_terminal_clipboard_text(session.get("last_bot_text")),
+        "attached_model_path": str(session.get("attached_model_path") or ""),
+        "attached_model_name": str(session.get("attached_model_name") or ""),
         "settings": normalize_dialog_runtime_settings(session.get("settings")),
         "history": normalize_terminal_session_history(session.get("history", [])),
     }
@@ -2143,6 +2177,7 @@ def load_terminal_session(session_number: int) -> tuple[dict[str, Any] | None, b
     title = str(raw_payload.get("title") or "").strip()
     if title:
         session["title"] = truncate_text(title, TERMINAL_SESSION_TITLE_CHARS)
+    session["tags"] = normalize_terminal_session_tags(raw_payload.get("tags"))
 
     for key in ("created_at", "updated_at", "last_opened_at"):
         raw_value = str(raw_payload.get(key) or "").strip()
@@ -2155,6 +2190,8 @@ def load_terminal_session(session_number: int) -> tuple[dict[str, Any] | None, b
     session["clipboard_text"] = normalize_terminal_clipboard_text(raw_payload.get("clipboard_text"))
     session["last_user_text"] = normalize_terminal_clipboard_text(raw_payload.get("last_user_text"))
     session["last_bot_text"] = normalize_terminal_clipboard_text(raw_payload.get("last_bot_text"))
+    session["attached_model_path"] = str(raw_payload.get("attached_model_path") or session.get("attached_model_path") or "")
+    session["attached_model_name"] = str(raw_payload.get("attached_model_name") or session.get("attached_model_name") or "")
     session["settings"] = normalize_dialog_runtime_settings(raw_payload.get("settings"))
 
     history = normalize_terminal_session_history(raw_payload.get("history", []))
@@ -2209,10 +2246,13 @@ def persist_terminal_session_runtime(
     saved_char_limit: int | None,
     char_limit_save_choice_made: bool,
 ) -> None:
+    current_model = resolve_model_candidate(MODEL_PATH)
     session["saved_char_limit"] = clamp_terminal_session_char_limit(saved_char_limit)
     session["char_limit_save_choice_made"] = bool(char_limit_save_choice_made)
     session["updated_at"] = iso_now()
     session["prompt_signature"] = PROMPT_SNAPSHOT_SIGNATURE
+    session["attached_model_path"] = str(current_model or MODEL_PATH)
+    session["attached_model_name"] = current_model.name if current_model is not None else Path(str(MODEL_PATH)).name
     session["settings"] = normalize_dialog_runtime_settings(
         dialog_runtime_settings.get(dialog_key)
     )
@@ -2267,6 +2307,7 @@ def build_terminal_session_welcome_text(
 ) -> str:
     history = normalize_terminal_session_history(session.get("history", []))
     settings = normalize_dialog_runtime_settings(session.get("settings"))
+    tags = normalize_terminal_session_tags(session.get("tags"))
     lines = [
         "Терминальный режим активен.",
         (
@@ -2279,8 +2320,12 @@ def build_terminal_session_welcome_text(
         lines.append(f"Название: {session['title']}")
     if history:
         lines.append(f"Сообщений в памяти: {len(history)}")
+    if tags:
+        lines.append(f"Теги: {', '.join(tags)}")
     lines.append(f"Режим: {settings.get('response_mode')}")
     lines.append(f"Локальная БЗ: {'вкл' if settings.get('kb_enabled') else 'выкл'}")
+    if session.get("attached_model_name"):
+        lines.append(f"Модель: {session['attached_model_name']}")
     active_project_id = str(settings.get("active_project_id") or "").strip()
     if active_project_id:
         lines.append(f"Активный проект: {active_project_id[:8]}")
@@ -2295,7 +2340,7 @@ def build_terminal_session_welcome_text(
     lines.extend(
         [
             "Пиши запрос сюда. Для выхода введи /exit, exit или quit.",
-            "Команды: /help, /mode, /kb, /project, /model, /models, /tasks, /session, /limit, /reset, /repeat, /clipboard, /paste, /deepplan, /deepthink, /deepstatus, /deepcancel, /errors.",
+            "Команды: /help, /mode, /kb, /project, /model, /models, /tasks, /session, /limit, /reset, /repeat, /clipboard, /paste, /deepplan, /deepthink, /deepcontinue, /deepstatus, /deepcancel, /errors.",
         ]
     )
     if resume_text.strip():
@@ -4898,9 +4943,10 @@ def build_tasks_usage_text(prefix: str) -> str:
 
 def build_session_usage_text(prefix: str) -> str:
     return (
-        f"Команда: {prefix} show|rename <имя>|export [json|md]\n"
+        f"Команда: {prefix} show|rename <имя>|tags add <тег1,тег2>|tags remove <тег>|tags clear|export [json|md]\n"
         "- show: показать текущую terminal-сессию.\n"
         "- rename <имя>: вручную переименовать сессию.\n"
+        "- tags add/remove/clear: навесить метки на сессию, чтобы потом искать её не по запаху.\n"
         "- export [json|md]: выгрузить историю сессии в файл."
     )
 
@@ -5128,6 +5174,7 @@ async def execute_tasks_command(argument: str, owner_key: str) -> str:
 def render_terminal_session_details(session: dict[str, Any], dialog_key: str) -> str:
     history = normalize_terminal_session_history(session.get("history", []))
     settings = get_dialog_runtime_settings(dialog_key)
+    tags = normalize_terminal_session_tags(session.get("tags"))
     project_id = str(settings.get("active_project_id") or "").strip()
     if project_id:
         project = get_project_record(project_id)
@@ -5144,9 +5191,11 @@ def render_terminal_session_details(session: dict[str, Any], dialog_key: str) ->
         f"- название: {session.get('title') or 'Без названия'}\n"
         f"- запросов: {session.get('request_count', 0)}\n"
         f"- сообщений в памяти: {len(history)}\n"
+        f"- теги: {', '.join(tags) if tags else 'нет'}\n"
         f"- режим: {settings.get('response_mode')}\n"
         f"- локальная БЗ: {'вкл' if settings.get('kb_enabled') else 'выкл'}\n"
         f"- активный проект: {project_label}\n"
+        f"- модель: {session.get('attached_model_name') or 'не определилась'}\n"
         f"- обновлена: {session.get('updated_at') or '-'}"
     )
 
@@ -5165,6 +5214,8 @@ def export_terminal_session(session: dict[str, Any], *, fmt: str) -> Path:
         f"# Session #{session.get('session_number')}",
         "",
         f"Title: {session.get('title') or 'Без названия'}",
+        f"Tags: {', '.join(normalize_terminal_session_tags(session.get('tags'))) or '-'}",
+        f"Model: {session.get('attached_model_name') or '-'}",
         f"Updated: {session.get('updated_at') or '-'}",
         "",
     ]
@@ -5196,6 +5247,32 @@ async def execute_session_command(
         terminal_session["title"] = truncate_text(value, TERMINAL_SESSION_TITLE_CHARS)
         terminal_session["updated_at"] = iso_now()
         return f"Сессию переименовал в: {terminal_session['title']}"
+    if action == "tags":
+        if not value:
+            tags = normalize_terminal_session_tags(terminal_session.get("tags"))
+            return f"Теги сессии: {', '.join(tags) if tags else 'нет'}"
+        sub_parts = value.split(maxsplit=1)
+        sub_action = sub_parts[0].lower()
+        sub_value = sub_parts[1] if len(sub_parts) > 1 else ""
+        current_tags = normalize_terminal_session_tags(terminal_session.get("tags"))
+        if sub_action == "clear":
+            terminal_session["tags"] = []
+            terminal_session["updated_at"] = iso_now()
+            return "Теги сессии очищены."
+        if sub_action == "add":
+            next_tags = normalize_terminal_session_tags([*current_tags, *normalize_terminal_session_tags(sub_value)])
+            terminal_session["tags"] = next_tags
+            terminal_session["updated_at"] = iso_now()
+            return f"Теги обновил: {', '.join(next_tags) if next_tags else 'нет'}"
+        if sub_action == "remove":
+            needle_tags = {item.casefold() for item in normalize_terminal_session_tags(sub_value)}
+            if not needle_tags:
+                return build_session_usage_text("/session")
+            next_tags = [tag for tag in current_tags if tag.casefold() not in needle_tags]
+            terminal_session["tags"] = next_tags
+            terminal_session["updated_at"] = iso_now()
+            return f"Теги обновил: {', '.join(next_tags) if next_tags else 'нет'}"
+        return build_session_usage_text("/session")
     if action == "export":
         fmt = value.lower() if value else "md"
         if fmt not in {"json", "md"}:
@@ -6559,10 +6636,15 @@ def serialize_long_think_job(job: dict[str, Any]) -> dict[str, Any]:
         "template_ready_at": job.get("template_ready_at"),
         "latest_draft": job.get("latest_draft", ""),
         "final_answer": job.get("final_answer", ""),
+        "continued_from_job_id": job.get("continued_from_job_id", ""),
+        "seed_answer": job.get("seed_answer", ""),
         "answer_completed_fully": bool(job.get("answer_completed_fully")),
         "final_finish_reason": job.get("final_finish_reason", ""),
         "progress_percent": job.get("progress_percent", 0),
         "progress_banner": job.get("progress_banner", ""),
+        "draft_markdown_path": job.get("draft_markdown_path", ""),
+        "final_markdown_path": job.get("final_markdown_path", ""),
+        "template_markdown_path": job.get("template_markdown_path", ""),
         "average_cpu_percent": job.get("average_cpu_percent"),
         "average_ram_percent": job.get("average_ram_percent"),
         "average_gpu_percent": job.get("average_gpu_percent"),
@@ -6575,6 +6657,97 @@ def serialize_long_think_job(job: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def build_long_think_markdown_text(job: dict[str, Any], *, body: str, title: str) -> str:
+    lines = [
+        f"# {title}",
+        "",
+        f"- Job ID: {job.get('job_id')}",
+        f"- Статус: {job.get('status')}",
+        f"- Фаза: {job.get('phase')}",
+        f"- Создан: {job.get('created_at') or '-'}",
+        f"- Обновлён: {job.get('updated_at') or '-'}",
+        f"- Прогресс: {job.get('progress_percent', 0)}%",
+        f"- Полнота ответа: {'Да' if job.get('answer_completed_fully') else 'Нет'}",
+        "",
+        "## Запрос",
+        "",
+        str(job.get("request_text") or "").strip() or "_пусто_",
+        "",
+        "## Содержимое",
+        "",
+        body.strip() or "_пусто_",
+        "",
+    ]
+    if job.get("note"):
+        lines.extend(["## Заметка", "", str(job.get("note") or "").strip(), ""])
+    if job.get("continued_from_job_id"):
+        lines.extend(
+            [
+                "## Продолжение",
+                "",
+                f"Продолжен от job: {str(job.get('continued_from_job_id') or '')[:8]}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def persist_long_think_markdown_artifacts(job: dict[str, Any]) -> None:
+    artifact_dir = Path(job["artifact_dir"])
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    snapshots_root = artifact_dir / "snapshots"
+    snapshots_root.mkdir(parents=True, exist_ok=True)
+
+    template_outline = str(job.get("template_outline") or "").strip()
+    latest_draft = str(job.get("latest_draft") or "").strip()
+    final_answer = str(job.get("final_answer") or "").strip()
+
+    if template_outline:
+        template_path = artifact_dir / "template_outline.md"
+        template_path.write_text(
+            build_long_think_markdown_text(job, body=template_outline, title="Long-think template outline"),
+            encoding="utf-8",
+        )
+        job["template_markdown_path"] = str(template_path)
+    if latest_draft:
+        draft_path = artifact_dir / "current_draft.md"
+        draft_path.write_text(
+            build_long_think_markdown_text(job, body=latest_draft, title="Long-think current draft"),
+            encoding="utf-8",
+        )
+        job["draft_markdown_path"] = str(draft_path)
+    if final_answer or str(job.get("status") or "") in {"completed", "failed", "cancelled", "interrupted"}:
+        final_path = artifact_dir / "final_answer.md"
+        final_body = final_answer or latest_draft or "_финального текста нет_"
+        final_path.write_text(
+            build_long_think_markdown_text(job, body=final_body, title="Long-think final answer"),
+            encoding="utf-8",
+        )
+        job["final_markdown_path"] = str(final_path)
+
+    snapshot_body = final_answer or latest_draft or template_outline
+    snapshot_signature = (
+        str(job.get("phase") or ""),
+        len(latest_draft),
+        len(final_answer),
+        len(job.get("iterations") or []),
+        str(job.get("status") or ""),
+    )
+    if snapshot_body and job.get("_last_snapshot_signature") != snapshot_signature:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        phase_slug = make_safe_job_slug(str(job.get("phase") or "snapshot"))
+        snapshot_path = snapshots_root / f"{stamp}_{phase_slug}.md"
+        snapshot_path.write_text(
+            build_long_think_markdown_text(job, body=snapshot_body, title=f"Long-think snapshot: {job.get('phase') or '-'}"),
+            encoding="utf-8",
+        )
+        job["_last_snapshot_signature"] = snapshot_signature
+        snapshots = sorted(snapshots_root.glob("*.md"))
+        if len(snapshots) > LONG_THINK_SNAPSHOT_MAX_FILES:
+            for stale_path in snapshots[: len(snapshots) - LONG_THINK_SNAPSHOT_MAX_FILES]:
+                stale_path.unlink(missing_ok=True)
+
+
 def persist_long_think_job(job: dict[str, Any], *, final: bool = False) -> None:
     LONG_THINK_ROOT.mkdir(parents=True, exist_ok=True)
     artifact_dir = Path(job["artifact_dir"])
@@ -6582,6 +6755,7 @@ def persist_long_think_job(job: dict[str, Any], *, final: bool = False) -> None:
     result_path = artifact_dir / "result.json"
     job["result_path"] = str(result_path)
     job["updated_at"] = iso_now()
+    persist_long_think_markdown_artifacts(job)
     payload = serialize_long_think_job(job)
     (artifact_dir / "state.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -6689,10 +6863,15 @@ def hydrate_long_think_job(payload: dict[str, Any]) -> dict[str, Any]:
         "iterations": iterations,
         "latest_draft": str(payload.get("latest_draft") or ""),
         "final_answer": str(payload.get("final_answer") or ""),
+        "continued_from_job_id": str(payload.get("continued_from_job_id") or ""),
+        "seed_answer": str(payload.get("seed_answer") or ""),
         "answer_completed_fully": bool(payload.get("answer_completed_fully")),
         "final_finish_reason": str(payload.get("final_finish_reason") or ""),
         "progress_percent": max(0, int(payload.get("progress_percent") or 0)),
         "progress_banner": str(payload.get("progress_banner") or ""),
+        "draft_markdown_path": str(payload.get("draft_markdown_path") or ""),
+        "final_markdown_path": str(payload.get("final_markdown_path") or ""),
+        "template_markdown_path": str(payload.get("template_markdown_path") or ""),
         "progress_message_text": "",
         "progress_message": None,
         "progress_task": None,
@@ -6794,6 +6973,44 @@ def build_deepthink_usage_text(prefix: str) -> str:
     )
 
 
+def build_deepcontinue_usage_text(prefix: str) -> str:
+    return (
+        f"Команда: {prefix} <job_id> <длительность>\n"
+        "- Берёт завершённый long-think job и запускает продолжение поверх лучшего сохранённого ответа.\n"
+        "- Полезно, если хочешь дать модели ещё время на ту же задачу, а не начинать с нуля.\n\n"
+        f"{build_duration_syntax_text()}\n\n"
+        "Примеры:\n"
+        f"- {prefix} deadbeef 2h\n"
+        f"- {prefix} 97ea1eb9 00:45:00"
+    )
+
+
+def start_continued_long_think_job(
+    previous_job: dict[str, Any],
+    *,
+    mode: str,
+    owner_key: str,
+    duration_seconds: int,
+    chat_id: int | None = None,
+    user_id: int | None = None,
+    bot: Bot | None = None,
+) -> dict[str, Any]:
+    seed_answer = str(previous_job.get("final_answer") or previous_job.get("latest_draft") or "").strip()
+    if not seed_answer:
+        raise RuntimeError("В исходном long-think job нет текста, который можно продолжать.")
+    return start_long_think_job(
+        mode=mode,
+        owner_key=owner_key,
+        request_text=str(previous_job.get("request_text") or "").strip(),
+        duration_seconds=duration_seconds,
+        seed_answer=seed_answer,
+        continued_from_job_id=str(previous_job.get("job_id") or ""),
+        chat_id=chat_id,
+        user_id=user_id,
+        bot=bot,
+    )
+
+
 def build_port_manual_text(mode: str) -> str:
     sections = [
         "Что умеет этот порт:\n"
@@ -6807,6 +7024,7 @@ def build_port_manual_text(mode: str) -> str:
         "- Пакетный режим /ineedmore для нескольких независимых запросов.\n"
         "- Планировщик /deepplan, который сначала оценивает задачу и рекомендует срок.\n"
         "- Long-think / deepthink для длительной проработки больших задач.\n"
+        "- Продолжение long-think через /deepcontinue, если надо добить уже готовый результат ещё одним заходом.\n"
         "- Просмотр статуса, логов ошибок, источника и лицензии.",
         "/mode show|chat|code\n"
         "- Что делает: переключает режим текущего диалога.\n"
@@ -6834,10 +7052,14 @@ def build_port_manual_text(mode: str) -> str:
         "- Что делает: запускает длинную фоновую задачу по сроку, который ты указал сам. Бот строит шаблон ответа, заполняет его проходами, считает прогресс и нагрузку на железо, потом доводит всё до финала и складывает итог в JSON.\n"
         "- В terminal-режиме long-think старается пережить выход из SSH и продолжить работу без активного подключения.\n"
         "- Ограничение символов обычного чата на long-think не распространяется.\n"
-        "- Где результат: deep_think_jobs/<дата>_<id>_<slug>/result.json.\n"
+        "- Где результат: deep_think_jobs/<дата>_<id>_<slug>/result.json и final_answer.md.\n"
+        "- Во время работы пишет current_draft.md, template_outline.md и markdown-снапшоты по этапам.\n"
         "- Где смотреть прогресс: /deepstatus.\n"
         "- Как остановить: /deepcancel [job_id].\n"
         f"- {build_duration_syntax_text()}",
+        "/deepcontinue <job_id> <длительность>\n"
+        "- Что делает: запускает продолжение по завершённому long-think job на основе уже готового ответа.\n"
+        "- Когда полезно: если хочется дать модели ещё время на ту же задачу без старта с пустого места.",
         "/deepstatus\n"
         "- Что делает: показывает список последних long-think job'ов для текущего чата или terminal-сессии.\n"
         "- В terminal-режиме открывает отдельный экран со списком job'ов, подробностями и принудительной остановкой.\n"
@@ -6872,7 +7094,7 @@ def build_port_manual_text(mode: str) -> str:
                 "/deepplan <запрос>\n"
                 "- Что делает: оценивает большую задачу и предлагает срок для deepthink до запуска.",
                 "/session ...\n"
-                "- Что делает: показывает terminal-сессию, умеет переименовывать и экспортировать её.",
+                "- Что делает: показывает terminal-сессию, умеет переименовывать, вешать теги и экспортировать её.",
                 "/repeat | /clipboard ... | /paste\n"
                 "- /repeat: повторно отправляет последний обычный запрос.\n"
                 "- /clipboard user|bot|show|clear|set <текст>: внутренний буфер terminal-сессии.\n"
@@ -7502,6 +7724,8 @@ def create_long_think_job(
     owner_key: str,
     request_text: str,
     duration_seconds: int,
+    seed_answer: str = "",
+    continued_from_job_id: str = "",
     chat_id: int | None = None,
     user_id: int | None = None,
     bot: Bot | None = None,
@@ -7542,12 +7766,17 @@ def create_long_think_job(
         "template_outline": "",
         "template_ready_at": None,
         "iterations": [],
-        "latest_draft": "",
+        "latest_draft": str(seed_answer or "").strip(),
         "final_answer": "",
+        "continued_from_job_id": str(continued_from_job_id or "").strip(),
+        "seed_answer": str(seed_answer or "").strip(),
         "answer_completed_fully": False,
         "final_finish_reason": "",
         "progress_percent": 0,
         "progress_banner": "",
+        "draft_markdown_path": "",
+        "final_markdown_path": "",
+        "template_markdown_path": "",
         "progress_message_text": "",
         "progress_message": None,
         "progress_task": None,
@@ -7557,6 +7786,13 @@ def create_long_think_job(
         "average_gpu_percent": None,
         "metrics_task": None,
     }
+    if seed_answer:
+        job["note"] = (
+            f"Этот long-think продолжает job {continued_from_job_id[:8]}. "
+            "Стартовал не с пустого места, а с уже готового черновика."
+            if continued_from_job_id
+            else "Этот long-think стартовал с заранее подготовленного черновика."
+        )
     refresh_long_think_progress_snapshot(job)
     long_think_jobs[job_id] = job
     touch_long_think_job(job_id)
@@ -7638,6 +7874,8 @@ def start_long_think_job(
     owner_key: str,
     request_text: str,
     duration_seconds: int,
+    seed_answer: str = "",
+    continued_from_job_id: str = "",
     chat_id: int | None = None,
     user_id: int | None = None,
     bot: Bot | None = None,
@@ -7647,6 +7885,8 @@ def start_long_think_job(
         owner_key=owner_key,
         request_text=request_text,
         duration_seconds=duration_seconds,
+        seed_answer=seed_answer,
+        continued_from_job_id=continued_from_job_id,
         chat_id=chat_id,
         user_id=user_id,
         bot=bot,
@@ -8143,6 +8383,7 @@ async def handle_start(message: Message) -> None:
         "/ineedmore - собрать несколько запросов в один пакет.\n"
         "/deepplan - оценить задачу и подобрать срок для long-think.\n"
         "/deepthink - запустить долгий режим размышления.\n"
+        "/deepcontinue - продолжить завершённый long-think job.\n"
         "/deepstatus - показать статус long-think job'ов.\n"
         "/deepcancel - отменить long-think job.\n"
         "/errors - показать свежие логи ошибок.\n"
@@ -8475,6 +8716,77 @@ async def handle_deepthink(message: Message) -> None:
     )
     sent = await message.answer(
         build_long_think_started_text(job)
+        + "\nПроверять статус можно командой /deepstatus, остановить - /deepcancel."
+    )
+    track_bot_message(get_dialog_key(message), sent)
+
+
+@router.message(Command("deepcontinue"))
+async def handle_deepcontinue(message: Message) -> None:
+    if await reject_if_blocked_message(message):
+        return
+
+    owner_key = get_long_think_owner_key(
+        "telegram",
+        user_id=message.from_user.id if message.from_user else None,
+        chat_id=message.chat.id,
+    )
+    active_job = get_active_long_think_job(owner_key)
+    if active_job is not None:
+        sent = await message.answer(
+            "У тебя уже есть активный long-think job.\n"
+            f"ID: {active_job['job_id'][:8]}\n"
+            f"Статус: {active_job['status']}\n"
+            f"Папка: {active_job['artifact_dir']}"
+        )
+        track_bot_message(get_dialog_key(message), sent)
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        sent = await message.answer(build_deepcontinue_usage_text("/deepcontinue"))
+        track_bot_message(get_dialog_key(message), sent)
+        return
+    source_job = find_long_think_job_for_owner(owner_key, parts[1].strip())
+    if source_job is None:
+        sent = await message.answer("Исходный long-think job не найден.")
+        track_bot_message(get_dialog_key(message), sent)
+        return
+    try:
+        duration_seconds = parse_duration_spec(parts[2])
+    except ValueError as exc:
+        sent = await message.answer(f"{exc}\n\n{build_deepcontinue_usage_text('/deepcontinue')}")
+        track_bot_message(get_dialog_key(message), sent)
+        return
+    try:
+        job = start_continued_long_think_job(
+            source_job,
+            mode="telegram",
+            owner_key=owner_key,
+            duration_seconds=duration_seconds,
+            chat_id=message.chat.id,
+            user_id=message.from_user.id if message.from_user else None,
+            bot=message.bot,
+        )
+    except Exception as exc:
+        sent = await message.answer(f"Не удалось продолжить job: {exc}")
+        track_bot_message(get_dialog_key(message), sent)
+        return
+    append_long_think_started_event(
+        job=job,
+        request_text=str(source_job.get("request_text") or ""),
+        source="continue",
+        chat=chat_payload(message),
+        user=user_payload(message),
+    )
+    sent = await message.answer(
+        build_long_think_started_text(
+            job,
+            intro_line=(
+                f"Продолжаю long-think от job {str(source_job.get('job_id') or '')[:8]} "
+                "поверх уже готового черновика."
+            ),
+        )
         + "\nПроверять статус можно командой /deepstatus, остановить - /deepcancel."
     )
     track_bot_message(get_dialog_key(message), sent)
@@ -9247,9 +9559,10 @@ def render_terminal_help_text() -> str:
         "/project ... - работа с проектами\n"
         "/model ... и /models - менеджер моделей\n"
         "/tasks ... - очередь фоновых задач\n"
-        "/session ... - управление текущей сессией\n"
+        "/session ... - управление текущей сессией, теги и экспорт\n"
         "/reset - сбросить память диалога\n"
         "/deepplan <запрос> - оценить задачу и предложить срок для deepthink\n"
+        "/deepcontinue <job_id> <длительность> - продолжить завершённый long-think\n"
         "/limit show - показать текущий сохранённый лимит\n"
         "/limit <число> - сохранить лимит символов\n"
         "/limit off - убрать сохранённый лимит\n"
@@ -9487,6 +9800,57 @@ async def handle_terminal_command(
 
     if stripped.startswith("/deepstatus"):
         await open_terminal_deepstatus_menu(terminal_owner_key)
+        return True, saved_char_limit, char_limit_save_choice_made, None
+
+    if stripped.startswith("/deepcontinue"):
+        active_job = get_active_long_think_job(terminal_owner_key)
+        if active_job is not None:
+            print(
+                "У тебя уже есть активный long-think job.\n"
+                f"ID: {active_job['job_id'][:8]}\n"
+                f"Папка: {active_job['artifact_dir']}\n",
+                flush=True,
+            )
+            return True, saved_char_limit, char_limit_save_choice_made, None
+        parts = stripped.split(maxsplit=2)
+        if len(parts) < 3:
+            print(build_deepcontinue_usage_text("/deepcontinue") + "\n", flush=True)
+            return True, saved_char_limit, char_limit_save_choice_made, None
+        source_job = find_long_think_job_for_owner(terminal_owner_key, parts[1].strip())
+        if source_job is None:
+            print("Исходный long-think job не найден.\n", flush=True)
+            return True, saved_char_limit, char_limit_save_choice_made, None
+        try:
+            duration_seconds = parse_duration_spec(parts[2])
+        except ValueError as exc:
+            print(f"{exc}\n\n{build_deepcontinue_usage_text('/deepcontinue')}\n", flush=True)
+            return True, saved_char_limit, char_limit_save_choice_made, None
+        try:
+            job = start_continued_long_think_job(
+                source_job,
+                mode="terminal",
+                owner_key=terminal_owner_key,
+                duration_seconds=duration_seconds,
+            )
+        except Exception as exc:
+            print(f"Не удалось продолжить job: {exc}\n", flush=True)
+            return True, saved_char_limit, char_limit_save_choice_made, None
+        append_long_think_started_event(
+            job=job,
+            request_text=str(source_job.get("request_text") or ""),
+            source="continue",
+        )
+        print(
+            build_long_think_started_text(
+                job,
+                intro_line=(
+                    f"Продолжаю long-think от job {str(source_job.get('job_id') or '')[:8]} "
+                    "поверх уже готового черновика."
+                ),
+            )
+            + "\nЕсли отвалишься по SSH, continuation тоже должен жить дальше отдельно от сессии.\n",
+            flush=True,
+        )
         return True, saved_char_limit, char_limit_save_choice_made, None
 
     if stripped.startswith("/deepcancel"):
